@@ -1,18 +1,21 @@
 import json
 import re
+import os
+import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs
 from urllib.request import urlopen, Request
 import xml.etree.ElementTree as ET
 
 HOST = "0.0.0.0"
-PORT = 8090
+PORT = int(os.getenv("DASHBOARD_PORT", "8090"))
 BASE = Path(__file__).resolve().parent
 WALLET = BASE / 'wallet.json'
 LOG = BASE / 'logs' / 'paper_runner.log'
 LAST = BASE / 'logs' / 'last_report.txt'
+CONTROL_TOKEN = os.getenv("CONTROL_TOKEN", "")
 
 
 def tail(path: Path, n=200):
@@ -87,12 +90,55 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _check_token(self, query):
+        if not CONTROL_TOKEN:
+            return True
+        token = query.get('token', [''])[0]
+        return token == CONTROL_TOKEN
+
+    def _run_control(self, cmd):
+        try:
+            out = subprocess.check_output(cmd, cwd=str(BASE), stderr=subprocess.STDOUT, text=True, timeout=20)
+            return {"ok": True, "output": out[-4000:]}
+        except subprocess.CalledProcessError as e:
+            return {"ok": False, "output": (e.output or '')[-4000:], "code": e.returncode}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def do_GET(self):
-        if self.path == '/health':
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path == '/health':
             self._send(200, 'application/json', b'{"ok":true}')
             return
 
-        if self.path == '/api/status':
+        if path == '/api/control/status':
+            if not self._check_token(query):
+                self._send(403, 'application/json; charset=utf-8', b'{"ok":false,"error":"forbidden"}')
+                return
+            payload = self._run_control(["bash", "status.sh"])
+            self._send(200, 'application/json; charset=utf-8', json.dumps(payload).encode('utf-8'))
+            return
+
+        if path == '/api/control/start':
+            if not self._check_token(query):
+                self._send(403, 'application/json; charset=utf-8', b'{"ok":false,"error":"forbidden"}')
+                return
+            payload = self._run_control(["bash", "start_all.sh"])
+            self._send(200, 'application/json; charset=utf-8', json.dumps(payload).encode('utf-8'))
+            return
+
+        if path == '/api/control/stop':
+            if not self._check_token(query):
+                self._send(403, 'application/json; charset=utf-8', b'{"ok":false,"error":"forbidden"}')
+                return
+            payload = self._run_control(["bash", "stop_all.sh"])
+            self._send(200, 'application/json; charset=utf-8', json.dumps(payload).encode('utf-8'))
+            return
+
+        if path == '/api/status':
             wallet = {}
             if WALLET.exists():
                 try:
