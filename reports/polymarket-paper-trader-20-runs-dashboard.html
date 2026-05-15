@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang='pt-BR'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Polymarket Paper Trader - Dashboard 20 execuções</title>
+<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #0f1115; color: #e8e8e8; }
+  h1,h2 { margin: 0 0 12px 0; }
+  .cards { display: grid; grid-template-columns: repeat(5, minmax(140px, 1fr)); gap: 12px; margin: 16px 0 22px; }
+  .card { background: #1a1f29; border: 1px solid #2a3140; border-radius: 10px; padding: 12px; }
+  .label { font-size: 12px; opacity: .8; }
+  .value { font-size: 20px; font-weight: bold; margin-top: 6px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .panel { background: #1a1f29; border: 1px solid #2a3140; border-radius: 10px; padding: 10px; }
+  canvas { width: 100%; height: 280px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 14px; font-size: 12px; }
+  th, td { border: 1px solid #31394a; padding: 6px; }
+  th { background: #222a38; position: sticky; top: 0; }
+  .ok { color: #53d178; }
+  .fail { color: #ff6b6b; }
+</style>
+</head>
+<body>
+  <h1>Polymarket Paper Trader - Dashboard (20 execuções)</h1>
+  <div class='cards'>
+    <div class='card'><div class='label'>Execuções</div><div class='value'>20</div></div>
+    <div class='card'><div class='label'>Sucesso</div><div class='value ok'>20</div></div>
+    <div class='card'><div class='label'>Falhas</div><div class='value fail'>0</div></div>
+    <div class='card'><div class='label'>Tempo médio (s)</div><div class='value'>0.245</div></div>
+    <div class='card'><div class='label'>Gerado em</div><div class='value' style='font-size:13px'>2026-05-15T09:37:20</div></div>
+  </div>
+
+  <div class='grid'>
+    <div class='panel'><h2>Bankroll por execução</h2><canvas id='bankrollChart'></canvas></div>
+    <div class='panel'><h2>Posições abertas e histórico</h2><canvas id='positionsChart'></canvas></div>
+    <div class='panel'><h2>Duração por execução (s)</h2><canvas id='durationChart'></canvas></div>
+    <div class='panel'><h2>Status de saída</h2><canvas id='statusChart'></canvas></div>
+  </div>
+
+  <h2 style='margin-top:20px'>Tabela resumida</h2>
+  <table>
+    <thead>
+      <tr><th>#</th><th>Timestamp</th><th>Exit</th><th>Duração(s)</th><th>Bankroll</th><th>Open</th><th>History</th><th>Cooldowns</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>2026-05-15T09:34:30</td><td>0</td><td>0.56</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>2</td><td>2026-05-15T09:34:31</td><td>0</td><td>0.233</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>3</td><td>2026-05-15T09:34:31</td><td>0</td><td>0.258</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>4</td><td>2026-05-15T09:34:31</td><td>0</td><td>0.249</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>5</td><td>2026-05-15T09:34:31</td><td>0</td><td>0.224</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>6</td><td>2026-05-15T09:34:32</td><td>0</td><td>0.249</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>7</td><td>2026-05-15T09:34:32</td><td>0</td><td>0.251</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>8</td><td>2026-05-15T09:34:32</td><td>0</td><td>0.226</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>9</td><td>2026-05-15T09:34:32</td><td>0</td><td>0.215</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>10</td><td>2026-05-15T09:34:33</td><td>0</td><td>0.23</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>11</td><td>2026-05-15T09:34:33</td><td>0</td><td>0.217</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>12</td><td>2026-05-15T09:34:33</td><td>0</td><td>0.237</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>13</td><td>2026-05-15T09:34:33</td><td>0</td><td>0.215</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>14</td><td>2026-05-15T09:34:33</td><td>0</td><td>0.221</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>15</td><td>2026-05-15T09:34:34</td><td>0</td><td>0.215</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>16</td><td>2026-05-15T09:34:34</td><td>0</td><td>0.208</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>17</td><td>2026-05-15T09:34:34</td><td>0</td><td>0.229</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>18</td><td>2026-05-15T09:34:34</td><td>0</td><td>0.219</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>19</td><td>2026-05-15T09:34:35</td><td>0</td><td>0.218</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr><tr><td>20</td><td>2026-05-15T09:34:35</td><td>0</td><td>0.222</td><td>90.7575</td><td>0</td><td>1</td><td>1</td></tr>
+    </tbody>
+  </table>
+
+<script>
+const runs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+const bankroll = [90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575, 90.7575];
+const openPos = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+const historyCount = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+const durations = [0.56, 0.233, 0.258, 0.249, 0.224, 0.249, 0.251, 0.226, 0.215, 0.23, 0.217, 0.237, 0.215, 0.221, 0.215, 0.208, 0.229, 0.219, 0.218, 0.222];
+const exits = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+const gridColor = 'rgba(255,255,255,0.08)';
+const tickColor = '#d8d8d8';
+
+new Chart(document.getElementById('bankrollChart'), {
+  type: 'line',
+  data: { labels: runs, datasets: [{ label: 'Bankroll', data: bankroll, borderColor: '#4cc9f0', backgroundColor: 'rgba(76,201,240,.2)', tension: 0.25 }] },
+  options: { responsive:true, plugins:{legend:{labels:{color:tickColor}}}, scales:{x:{ticks:{color:tickColor}, grid:{color:gridColor}}, y:{ticks:{color:tickColor}, grid:{color:gridColor}}} }
+});
+
+new Chart(document.getElementById('positionsChart'), {
+  type: 'line',
+  data: { labels: runs, datasets: [
+    { label: 'Open Positions', data: openPos, borderColor: '#f72585', tension: 0.25 },
+    { label: 'History Count', data: historyCount, borderColor: '#b8f2e6', tension: 0.25 }
+  ] },
+  options: { responsive:true, plugins:{legend:{labels:{color:tickColor}}}, scales:{x:{ticks:{color:tickColor}, grid:{color:gridColor}}, y:{ticks:{color:tickColor}, grid:{color:gridColor}}} }
+});
+
+new Chart(document.getElementById('durationChart'), {
+  type: 'bar',
+  data: { labels: runs, datasets: [{ label: 'Duração (s)', data: durations, backgroundColor: '#ffd166' }] },
+  options: { responsive:true, plugins:{legend:{labels:{color:tickColor}}}, scales:{x:{ticks:{color:tickColor}, grid:{color:gridColor}}, y:{ticks:{color:tickColor}, grid:{color:gridColor}}} }
+});
+
+const okCount = exits.filter(x => x === 0).length;
+const failCount = exits.length - okCount;
+new Chart(document.getElementById('statusChart'), {
+  type: 'doughnut',
+  data: { labels: ['Sucesso','Falha'], datasets: [{ data: [okCount, failCount], backgroundColor: ['#53d178','#ff6b6b'] }] },
+  options: { plugins:{legend:{labels:{color:tickColor}}} }
+});
+</script>
+</body>
+</html>
