@@ -106,6 +106,47 @@ async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> Li
     return signals[:max_pick]
 
 
+def score_signal(signal: Dict[str, Any]) -> float:
+    """Composite score for ranking candidate paper orders."""
+    confidence = float(signal.get("confidence", 0.0) or 0.0)
+    edge = abs(float(signal.get("edge", 0.0) or 0.0))
+    spread = float(signal.get("spread", 0.0) or 0.0)
+    liquidity = float(signal.get("liquidity", 0.0) or 0.0)
+    market_probability = float(signal.get("market_probability", 0.5) or 0.5)
+
+    liq_norm = min(liquidity / 25_000.0, 1.0)
+    spread_penalty = min(spread / 0.20, 1.0)
+    extremeness_penalty = abs(market_probability - 0.5) * 2.0
+
+    return (
+        (0.45 * confidence)
+        + (0.35 * edge)
+        + (0.20 * liq_norm)
+        - (0.10 * spread_penalty)
+        - (0.05 * extremeness_penalty)
+    )
+
+
+def select_best_orders(signals: List[Dict[str, Any]], max_pick: int) -> List[Dict[str, Any]]:
+    """Select top signals with diversification by market+direction."""
+    ranked = sorted(signals, key=score_signal, reverse=True)
+    picks: List[Dict[str, Any]] = []
+    seen_keys = set()
+
+    for signal in ranked:
+        market_key = signal.get("event_slug") or signal.get("market_id") or signal.get("market_slug") or ""
+        direction = (signal.get("direction") or "yes").lower()
+        dedupe_key = (market_key, direction)
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        picks.append(signal)
+        if len(picks) >= max_pick:
+            break
+
+    return picks
+
+
 def _extract_news_query(signal: Dict[str, Any]) -> str:
     title = (signal.get("event_title") or "").strip()
     slug = (signal.get("event_slug") or "").replace("-", " ").strip()
@@ -325,10 +366,9 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
     actionable = [s for s in signals if abs(s.get("edge", 0)) >= min_edge]
     # Enrich with OSINT (deterministic) before final ordering/selection
     actionable = await apply_osint_google_news(actionable)
-    # Sort by confidence * edge
-    actionable.sort(key=lambda s: s.get("confidence", 0) * abs(s.get("edge", 0)), reverse=True)
-    # Take top N (heuristic) or let local LLM re-rank in paper mode
-    top_signals = actionable[:max_per_scan]
+    # Rank with composite score + market/direction diversification
+    top_signals = select_best_orders(actionable, max_per_scan)
+    # Optional local LLM re-rank over already filtered picks
     if LLM_PAPER_ENABLED and top_signals:
         top_signals = await llm_select_signals(top_signals, max_per_scan)
 
@@ -465,4 +505,3 @@ if __name__ == "__main__":
         print(format_report(report))
 
     asyncio.run(_main())
-
