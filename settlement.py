@@ -11,6 +11,9 @@ import os
 import re
 import sys
 from pathlib import Path
+
+import xml.etree.ElementTree as ET
+from urllib.parse import quote_plus
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,6 +29,11 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 LLM_PAPER_ENABLED = os.getenv("PAPER_LLM_ENABLED", "0") == "1"
 LLM_PAPER_URL = os.getenv("PAPER_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
 LLM_PAPER_MODE = os.getenv("PAPER_LLM_MODE", "balanced")
+
+OSINT_GOOGLE_NEWS_ENABLED = os.getenv("PAPER_OSINT_GOOGLE_NEWS_ENABLED", "0") == "1"
+OSINT_GOOGLE_NEWS_WINDOW_HOURS = int(os.getenv("PAPER_OSINT_GOOGLE_NEWS_WINDOW_HOURS", "24"))
+OSINT_GOOGLE_NEWS_MAX_ARTICLES = int(os.getenv("PAPER_OSINT_GOOGLE_NEWS_MAX_ARTICLES", "8"))
+OSINT_GOOGLE_NEWS_BONUS_CAP = float(os.getenv("PAPER_OSINT_GOOGLE_NEWS_BONUS_CAP", "0.03"))
 
 
 async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> List[Dict[str, Any]]:
@@ -96,6 +104,66 @@ async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> Li
         logger.warning("LLM selector unavailable/fallback: %s", e)
 
     return signals[:max_pick]
+
+
+def _extract_news_query(signal: Dict[str, Any]) -> str:
+    title = (signal.get("event_title") or "").strip()
+    slug = (signal.get("event_slug") or "").replace("-", " ").strip()
+    raw = title or slug
+    tokens = [t for t in re.findall(r"[A-Za-z0-9']+", raw) if len(t) > 2]
+    return " ".join(tokens[:8])
+
+async def _google_news_count(query: str, *, window_hours: int, max_articles: int) -> int:
+    if not query:
+        return 0
+    url = f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+    now = datetime.now(timezone.utc)
+    count = 0
+    try:
+        async with httpx.AsyncClient(timeout=12.0, trust_env=False) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+        for item in root.findall("./channel/item"):
+            pub = (item.findtext("pubDate") or "").strip()
+            if not pub:
+                continue
+            try:
+                dt = datetime.strptime(pub, "%a, %d %b %Y %H:%M:%S %Z").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            age_hours = (now - dt).total_seconds() / 3600
+            if age_hours <= window_hours:
+                count += 1
+                if count >= max_articles:
+                    break
+    except Exception as e:
+        logger.warning("Google News OSINT lookup failed for query='%s': %s", query, e)
+    return count
+
+async def apply_osint_google_news(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not OSINT_GOOGLE_NEWS_ENABLED or not signals:
+        return signals
+
+    async def enrich(signal: Dict[str, Any]) -> Dict[str, Any]:
+        query = _extract_news_query(signal)
+        count = await _google_news_count(
+            query,
+            window_hours=OSINT_GOOGLE_NEWS_WINDOW_HOURS,
+            max_articles=OSINT_GOOGLE_NEWS_MAX_ARTICLES,
+        )
+        bonus = min(OSINT_GOOGLE_NEWS_BONUS_CAP, 0.005 * count)
+        enriched = dict(signal)
+        enriched["osint_news_query"] = query
+        enriched["osint_news_hits"] = count
+        enriched["osint_bonus"] = round(bonus, 4)
+        enriched["osint_score"] = round(min(1.0, count / max(1, OSINT_GOOGLE_NEWS_MAX_ARTICLES)), 4)
+        enriched["edge"] = float(enriched.get("edge", 0.0) or 0.0) + bonus
+        return enriched
+
+    enriched_signals = await asyncio.gather(*(enrich(s) for s in signals))
+    logger.info("Google News OSINT enriched %d signals", len(enriched_signals))
+    return list(enriched_signals)
 
 async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Fetch current prices for a list of market IDs from Gamma API.
@@ -255,6 +323,8 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
 
     # Filter actionable signals
     actionable = [s for s in signals if abs(s.get("edge", 0)) >= min_edge]
+    # Enrich with OSINT (deterministic) before final ordering/selection
+    actionable = await apply_osint_google_news(actionable)
     # Sort by confidence * edge
     actionable.sort(key=lambda s: s.get("confidence", 0) * abs(s.get("edge", 0)), reverse=True)
     # Take top N (heuristic) or let local LLM re-rank in paper mode
