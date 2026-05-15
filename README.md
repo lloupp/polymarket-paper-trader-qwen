@@ -61,6 +61,17 @@ cp .env.example .env
 - O fechamento de trades continua **determinístico** por regra de risco e mercado resolvido.
 - Isso mantém robustez operacional em modelos pequenos.
 
+## Camada OSINT (Plano B)
+- O projeto pode enriquecer sinais com **Google News RSS** de forma determinística (sem LLM).
+- Quando habilitado, cada sinal recebe `osint_news_hits`, `osint_score` e um pequeno `osint_bonus` no edge.
+- Depois desse enriquecimento, o fluxo opcional com Qwen continua para rerank final.
+
+### Flags OSINT
+- `PAPER_OSINT_GOOGLE_NEWS_ENABLED` (1/0)
+- `PAPER_OSINT_GOOGLE_NEWS_WINDOW_HOURS` (janela de recência)
+- `PAPER_OSINT_GOOGLE_NEWS_MAX_ARTICLES` (cap de artigos por sinal)
+- `PAPER_OSINT_GOOGLE_NEWS_BONUS_CAP` (bônus máximo adicionado ao edge)
+
 ## Comandos úteis
 - Iniciar: `./start_all.sh`
 - Status: `./status.sh`
