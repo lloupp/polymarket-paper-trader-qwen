@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.EditText
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import java.net.HttpURLConnection
@@ -12,9 +13,8 @@ import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
+    private lateinit var etBaseUrl: EditText
 
-    // Troque para o IP do seu servidor na rede local (ex: http://192.168.0.15:8090)
-    private val baseUrl = "http://127.0.0.1:8090"
     // Se configurar CONTROL_TOKEN no servidor, preencha aqui:
     private val token = ""
 
@@ -23,9 +23,14 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         webView = findViewById(R.id.webView)
+        etBaseUrl = findViewById(R.id.etBaseUrl)
+        val prefs = getSharedPreferences("polymarket_control", MODE_PRIVATE)
+        val defaultUrl = "http://192.168.0.10:8090"
+        etBaseUrl.setText(prefs.getString("baseUrl", defaultUrl) ?: defaultUrl)
+
         webView.settings.javaScriptEnabled = true
         webView.webViewClient = WebViewClient()
-        webView.loadUrl(baseUrl)
+        webView.loadUrl(currentBaseUrl())
 
         findViewById<Button>(R.id.btnStart).setOnClickListener { callControl("start") }
         findViewById<Button>(R.id.btnStop).setOnClickListener { callControl("stop") }
@@ -35,6 +40,12 @@ class MainActivity : AppCompatActivity() {
     private fun callControl(action: String) {
         thread {
             try {
+                val baseUrl = currentBaseUrl()
+                getSharedPreferences("polymarket_control", MODE_PRIVATE)
+                    .edit()
+                    .putString("baseUrl", baseUrl)
+                    .apply()
+
                 val tk = if (token.isNotBlank()) "?token=$token" else ""
                 val url = URL("$baseUrl/api/control/$action$tk")
                 val conn = (url.openConnection() as HttpURLConnection).apply {
@@ -45,7 +56,7 @@ class MainActivity : AppCompatActivity() {
                 val code = conn.responseCode
                 runOnUiThread {
                     Toast.makeText(this, "$action -> HTTP $code", Toast.LENGTH_SHORT).show()
-                    if (action == "status") webView.reload()
+                    if (action == "status") webView.loadUrl(baseUrl)
                 }
             } catch (e: Exception) {
                 runOnUiThread {
@@ -53,5 +64,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    private fun currentBaseUrl(): String {
+        val raw = etBaseUrl.text?.toString()?.trim().orEmpty().ifBlank { "http://192.168.0.10:8090" }
+        return raw.removeSuffix("/")
     }
 }
