@@ -97,6 +97,44 @@ async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> Li
 
     return signals[:max_pick]
 
+
+
+def score_signal(signal: Dict[str, Any]) -> float:
+    """Composite score to find better paper orders.
+
+    Prioritizes edge and confidence, then favors liquid/tighter markets and
+    slightly penalizes expensive entries near 1.0 (worse payoff asymmetry).
+    """
+    edge = abs(float(signal.get("edge", 0.0) or 0.0))
+    conf = float(signal.get("confidence", 0.0) or 0.0)
+    spread = float(signal.get("spread", 0.02) or 0.02)
+    liquidity = float(signal.get("liquidity", 0.0) or 0.0)
+    market_prob = float(signal.get("market_probability", 0.5) or 0.5)
+
+    edge_conf = edge * (0.5 + conf)
+    spread_bonus = max(0.0, 0.03 - spread)
+    liq_bonus = min(liquidity / 100000.0, 0.2)
+    payoff_penalty = max(0.0, market_prob - 0.85) * 0.3
+
+    return edge_conf + spread_bonus + liq_bonus - payoff_penalty
+
+
+def select_best_orders(signals: List[Dict[str, Any]], max_pick: int) -> List[Dict[str, Any]]:
+    """Select best candidate orders with diversification by event/market."""
+    ranked = sorted(signals, key=score_signal, reverse=True)
+    selected: List[Dict[str, Any]] = []
+    seen_markets = set()
+
+    for s in ranked:
+        key = (s.get("event_slug") or s.get("market_id") or "", s.get("direction", "yes").upper())
+        if key in seen_markets:
+            continue
+        selected.append(s)
+        seen_markets.add(key)
+        if len(selected) >= max_pick:
+            break
+    return selected
+
 async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Fetch current prices for a list of market IDs from Gamma API.
     Returns {market_id: {"yes_price": float, "no_price": float, "closed": bool, "resolved": bool}}
@@ -255,10 +293,9 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
 
     # Filter actionable signals
     actionable = [s for s in signals if abs(s.get("edge", 0)) >= min_edge]
-    # Sort by confidence * edge
-    actionable.sort(key=lambda s: s.get("confidence", 0) * abs(s.get("edge", 0)), reverse=True)
-    # Take top N (heuristic) or let local LLM re-rank in paper mode
-    top_signals = actionable[:max_per_scan]
+    # Select best orders with a richer scoring (edge/confidence/liquidity/spread).
+    top_signals = select_best_orders(actionable, max_per_scan)
+    # Optional local LLM pass to re-rank selected candidates.
     if LLM_PAPER_ENABLED and top_signals:
         top_signals = await llm_select_signals(top_signals, max_per_scan)
 
