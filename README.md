@@ -7,6 +7,14 @@ Projeto de paper trading para Polymarket com:
 - seleção de entradas com LLM local pequeno (Qwen),
 - dashboard web para acompanhar operação.
 
+## Resumo único ("tudo junto")
+1. O sistema **fecha posições primeiro** por regras determinísticas (stop-loss/take-profit/mercado resolvido).
+2. Depois, roda o scanner para gerar sinais.
+3. Em seguida, se habilitado, usa o Qwen local para selecionar/reordenar entradas.
+4. Por fim, abre novas operações em modo paper.
+
+Esse ciclo roda continuamente a cada 5 minutos via `paper_loop.sh`.
+
 ## Stack
 - Python 3.10+
 - `httpx`
@@ -52,9 +60,29 @@ cp .env.example .env
 ./status.sh
 ```
 
-## URLs
+## Comandos principais
+- Subir tudo: `./start_all.sh`
+- Ver status: `./status.sh`
+- Parar tudo: `./stop_all.sh`
+
+## Endpoints
+- LLM local: `http://127.0.0.1:8080/v1/chat/completions`
+- Health LLM: `http://127.0.0.1:8080/health`
 - Dashboard: `http://127.0.0.1:8090`
-- LLM health: `http://127.0.0.1:8080/health`
+- Health dashboard: `http://127.0.0.1:8090/health`
+
+## Configuração por ambiente
+Ajuste no `.env`:
+- `PAPER_LLM_ENABLED` (1/0)
+- `PAPER_LLM_MODE` (fast/balanced)
+- `PAPER_LLM_URL`
+- `LLM_PORT`, `DASHBOARD_PORT`
+
+## Logs
+- `logs/paper_runner.log`
+- `logs/last_report.txt`
+- `logs/llm_server.log`
+- `logs/monitor_web.log`
 
 ## Como funciona o papel do Qwen
 - O Qwen é usado para **selecionar/rerankear sinais de entrada**.
@@ -71,11 +99,6 @@ cp .env.example .env
 - `PAPER_OSINT_GOOGLE_NEWS_WINDOW_HOURS` (janela de recência)
 - `PAPER_OSINT_GOOGLE_NEWS_MAX_ARTICLES` (cap de artigos por sinal)
 - `PAPER_OSINT_GOOGLE_NEWS_BONUS_CAP` (bônus máximo adicionado ao edge)
-
-## Comandos úteis
-- Iniciar: `./start_all.sh`
-- Status: `./status.sh`
-- Parar: `./stop_all.sh`
 
 ## Observações
 - Este projeto é paper trading (simulação), sem ordens reais.
