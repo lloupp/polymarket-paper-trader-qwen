@@ -122,12 +122,26 @@ def compute_learning_metrics(ls: Dict[str, Any]) -> Dict[str, Any]:
 
     for f in feats:
         s = str(f.get("strategy") or "unknown")
-        sb = strategy_stats.setdefault(s, {"n": 0, "wins": 0, "pnl_sum": 0.0, "stop_loss": 0, "avg_hold_minutes": 0.0})
+        sb = strategy_stats.setdefault(
+            s,
+            {
+                "n": 0,
+                "wins": 0,
+                "pnl_sum": 0.0,
+                "stop_loss": 0,
+                "avg_hold_minutes": 0.0,
+                "_hold_sum": 0.0,
+                "_hold_count": 0,
+            },
+        )
         sb["n"] += 1
         sb["wins"] += 1 if int(f.get("win") or 0) == 1 else 0
         sb["pnl_sum"] += float(f.get("pnl") or 0)
         if str(f.get("close_reason") or "") == "stop_loss":
             sb["stop_loss"] += 1
+        if f.get("hold_minutes") is not None:
+            sb["_hold_sum"] += float(f.get("hold_minutes") or 0.0)
+            sb["_hold_count"] += 1
 
         b = str(f.get("edge_bucket") or "unknown")
         eb = edge_stats.setdefault(b, {"n": 0, "wins": 0, "pnl_sum": 0.0})
@@ -142,6 +156,9 @@ def compute_learning_metrics(ls: Dict[str, Any]) -> Dict[str, Any]:
         d["winrate"] = round((wins + 1) / (n + 2), 6)
         d["avg_pnl"] = round(float(d["pnl_sum"]) / n, 6)
         d["stop_loss_rate"] = round(float(d["stop_loss"]) / n, 6)
+        hold_count = int(d.pop("_hold_count", 0) or 0)
+        hold_sum = float(d.pop("_hold_sum", 0.0) or 0.0)
+        d["avg_hold_minutes"] = round(hold_sum / hold_count, 6) if hold_count else None
 
     for b, d in edge_stats.items():
         n = max(1, int(d["n"]))
@@ -216,7 +233,12 @@ def maybe_refresh_policy(ls: Dict[str, Any], wallet_settings: Dict[str, Any]) ->
     ls["cycle_counter"] = int(ls.get("cycle_counter") or 0) + 1
     cooldown = int(ls.get("cooldown_cycles") or 10)
     last = int(ls.get("last_policy_cycle") or 0)
-    if (ls["cycle_counter"] - last) < cooldown and ls.get("policy_recommendations"):
+    rec = ls.get("policy_recommendations") or {}
+    has_features = bool(ls.get("trades_features"))
+    has_metrics = bool(ls.get("strategy_stats")) or bool(ls.get("edge_buckets_stats"))
+    is_boot_policy = not rec.get("updated_at") or "boot" in list(rec.get("reasons") or [])
+    needs_initial_refresh = has_features and (not has_metrics or is_boot_policy)
+    if (not needs_initial_refresh) and (ls["cycle_counter"] - last) < cooldown and rec:
         return ls["policy_recommendations"]
 
     compute_learning_metrics(ls)
