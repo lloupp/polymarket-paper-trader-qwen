@@ -49,7 +49,7 @@ _install_polymarket_dns_fallback()
 
 LLM_PAPER_ENABLED = os.getenv("PAPER_LLM_ENABLED", "0") == "1"
 LLM_PAPER_URL = os.getenv("PAPER_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
-LLM_PAPER_MODE = os.getenv("PAPER_LLM_MODE", "balanced")
+LLM_PAPER_MODE = os.getenv("PAPER_LLM_MODE", "fast")
 PAPER_DISABLE_NEW_ENTRIES = os.getenv("PAPER_DISABLE_NEW_ENTRIES", "0") == "1"
 
 OSINT_GOOGLE_NEWS_ENABLED = os.getenv("PAPER_OSINT_GOOGLE_NEWS_ENABLED", "0") == "1"

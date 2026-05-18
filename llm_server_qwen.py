@@ -32,7 +32,7 @@ _model_lock = threading.Lock()
 
 
 def get_llm(mode: str):
-    normalized = mode if mode in MODEL_SPECS else "balanced"
+    normalized = mode if mode in MODEL_SPECS else "fast"
     with _model_lock:
         if normalized not in _models:
             spec = MODEL_SPECS[normalized]

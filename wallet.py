@@ -28,7 +28,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_per_scan": 10,
     "min_edge": 0.05,
     "llm_enabled": False,
-    "llm_mode": "balanced",
+    "llm_mode": "fast",
     "llm_url": "http://127.0.0.1:8080/v1/chat/completions",
     "min_net_edge": 0.035,
     "taker_fee_estimate": 0.001,

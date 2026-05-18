@@ -12,6 +12,8 @@ fi
 LLM_PORT="${LLM_PORT:-8080}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8090}"
 HEALTH_HOST="${HEALTH_HOST:-127.0.0.1}"
+PAPER_LLM_ENABLED="${PAPER_LLM_ENABLED:-0}"
+PAPER_LLM_SERVER_ENABLED="${PAPER_LLM_SERVER_ENABLED:-$PAPER_LLM_ENABLED}"
 
 pid_status() {
   local name="$1"
@@ -29,12 +31,20 @@ pid_status() {
 }
 
 echo "=== processos ==="
-pid_status "LLM" "logs/llm_server.pid" "llm_server_qwen.py"
+if [ "$PAPER_LLM_SERVER_ENABLED" = "1" ]; then
+  pid_status "LLM" "logs/llm_server.pid" "llm_server_qwen.py"
+else
+  echo "LLM: desabilitado"
+fi
 pid_status "paper_loop" "logs/paper_loop.pid" "paper_loop.sh"
 pid_status "dashboard" "logs/monitor_web.pid" "monitor_web.py"
 
 printf "\n=== health LLM ===\n"
-curl -sS --max-time 6 "http://${HEALTH_HOST}:${LLM_PORT}/health" || true
+if [ "$PAPER_LLM_SERVER_ENABLED" = "1" ]; then
+  curl -sS --max-time 6 "http://${HEALTH_HOST}:${LLM_PORT}/health" || true
+else
+  echo '{"ok":true,"llm_server":"disabled"}'
+fi
 
 printf "\n=== health dashboard ===\n"
 curl -sS --max-time 6 "http://${HEALTH_HOST}:${DASHBOARD_PORT}/health" || true

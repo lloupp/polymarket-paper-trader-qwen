@@ -1222,7 +1222,7 @@ async function saveLlmSettings(){
   const status = document.getElementById('llmStatus');
   const payload = {
     llm_enabled: !!document.getElementById('sLlmEnabled')?.checked,
-    llm_mode: String(document.getElementById('sLlmMode')?.value || 'balanced'),
+    llm_mode: String(document.getElementById('sLlmMode')?.value || 'fast'),
     llm_url: String(document.getElementById('sLlmUrl')?.value || 'http://127.0.0.1:8080/v1/chat/completions'),
   };
   status.textContent = 'Salvando LLM...';

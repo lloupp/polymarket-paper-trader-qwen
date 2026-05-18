@@ -28,6 +28,8 @@ fi
 
 LLM_PORT="${LLM_PORT:-8080}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8090}"
+PAPER_LLM_ENABLED="${PAPER_LLM_ENABLED:-0}"
+PAPER_LLM_SERVER_ENABLED="${PAPER_LLM_SERVER_ENABLED:-$PAPER_LLM_ENABLED}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if [ -x "$BASE_DIR/.venv/bin/python" ]; then
   PYTHON_BIN="$BASE_DIR/.venv/bin/python"
@@ -153,12 +155,16 @@ start_paper_loop() {
   fi
 }
 
-start_python_service \
-  "LLM" \
-  "llm_server_qwen.py" \
-  "logs/llm_server.pid" \
-  "logs/llm_server.log" \
-  "http://${HEALTH_HOST}:${LLM_PORT}/health"
+if [ "$PAPER_LLM_SERVER_ENABLED" = "1" ]; then
+  start_python_service \
+    "LLM" \
+    "llm_server_qwen.py" \
+    "logs/llm_server.pid" \
+    "logs/llm_server.log" \
+    "http://${HEALTH_HOST}:${LLM_PORT}/health"
+else
+  echo "LLM desabilitado (PAPER_LLM_SERVER_ENABLED=0); servidor Qwen nao sera iniciado"
+fi
 
 start_paper_loop
 
@@ -171,7 +177,11 @@ start_python_service \
 
 echo
 echo "Health checks:"
-curl -fsS --max-time 6 "http://${HEALTH_HOST}:${LLM_PORT}/health" || true
+if [ "$PAPER_LLM_SERVER_ENABLED" = "1" ]; then
+  curl -fsS --max-time 6 "http://${HEALTH_HOST}:${LLM_PORT}/health" || true
+else
+  echo '{"ok":true,"llm_server":"disabled"}'
+fi
 echo
 curl -fsS --max-time 6 "http://${HEALTH_HOST}:${DASHBOARD_PORT}/health" || true
 echo
