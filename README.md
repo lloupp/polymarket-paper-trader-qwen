@@ -194,6 +194,10 @@ Variáveis mais importantes do `.env`:
 - `PAPER_SLIPPAGE_ESTIMATE`: estimativa de slippage.
 - `PAPER_POLYMARKET_STATIC_DNS`: fallback DNS estático, desligado por padrão.
 - `PAPER_WALLET_BACKUP_ENABLED`: backup local da carteira antes de cada ciclo.
+- `PAPER_LEARNING_STORE_ENABLED`: registra todos os sinais/decisões em log append-only.
+- `PAPER_LEARNING_OUTCOME_HORIZON_MINUTES`: tempo mínimo para observar outcome posterior de sinais.
+- `PAPER_LEARNING_PENDING_MAX`: limite de sinais pendentes aguardando outcome.
+- `PAPER_LEARNING_PENDING_MAX_AGE_HOURS`: idade máxima de sinal pendente.
 - `PAPER_OSINT_GOOGLE_NEWS_ENABLED`: enriquecimento OSINT via Google News RSS.
 
 ## Estratégias
@@ -210,6 +214,14 @@ PAPER_SHADOW_STRATEGIES=arbitrage,value,mean_reversion,volume_spike
 ```
 
 Estratégias em shadow aparecem nos relatórios, mas não viram entradas paper até serem removidas de `PAPER_SHADOW_STRATEGIES` ou alteradas pelo dashboard.
+
+## Learning
+O projeto tem dois níveis de aprendizado:
+
+- `wallet.learning_state`: aprende com trades paper fechados e ajusta `effective_min_edge` e multiplicadores por estratégia.
+- `logs/learning_events.jsonl`: registra todos os sinais, inclusive rejeitados e não selecionados, para análise contra-factual.
+
+O learning store grava eventos `signal_decision` a cada ciclo. Depois de `PAPER_LEARNING_OUTCOME_HORIZON_MINUTES`, se o mesmo mercado aparecer de novo no scanner, ele grava `signal_outcome` com retorno paper estimado. Isso permite medir se sinais rejeitados teriam sido bons antes de alterar a política de execução.
 
 ## Dashboard
 O dashboard permite:
@@ -231,6 +243,8 @@ Importante: para habilitar LLM pelo dashboard, o servidor Qwen precisa estar rod
 - `logs/last_report.json`: último relatório estruturado.
 - `logs/llm_server.log`: log do servidor Qwen.
 - `logs/monitor_web.log`: log do dashboard.
+- `logs/learning_events.jsonl`: eventos append-only de sinais, decisões e outcomes contra-factuais.
+- `logs/learning_pending_signals.json`: índice local de sinais aguardando outcome posterior.
 - `logs/wallet_backups/`: backups locais da wallet.
 
 ## Troubleshooting

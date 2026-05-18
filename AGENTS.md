@@ -46,6 +46,7 @@ Copiar `.env.example` para `.env` e ajustar:
 - `PAPER_SHADOW_STRATEGIES`
 - `PAPER_POLYMARKET_STATIC_DNS`
 - `PAPER_WALLET_BACKUP_ENABLED`, `PAPER_WALLET_BACKUP_RETENTION`
+- `PAPER_LEARNING_STORE_ENABLED`, `PAPER_LEARNING_OUTCOME_HORIZON_MINUTES`, `PAPER_LEARNING_PENDING_MAX`
 
 ## Logs
 - `logs/paper_runner.log`
@@ -53,6 +54,8 @@ Copiar `.env.example` para `.env` e ajustar:
 - `logs/last_report.json`
 - `logs/llm_server.log`
 - `logs/monitor_web.log`
+- `logs/learning_events.jsonl`
+- `logs/learning_pending_signals.json`
 - `logs/wallet_backups/`
 
 ## Startup/portabilidade
@@ -63,6 +66,11 @@ Copiar `.env.example` para `.env` e ajustar:
 - Para rodar sem LLM, usar `PAPER_LLM_ENABLED=0` e `PAPER_LLM_SERVER_ENABLED=0`; nesse modo `status.sh` não deve tratar LLM desligado como erro.
 - Para máquina com 8GB de RAM, começar com `PAPER_LLM_MODE=fast`; `balanced` tende a rodar, mas pode ficar lento; `strong` não é recomendado como padrão.
 - Em máquina nova, se `llama-cpp-python` falhar, instalar ferramentas de build (`python3-venv`, `python3-dev`, `build-essential`, `cmake`) e rodar `./bootstrap.sh --force`.
+
+## Learning
+- `learning.py` aprende com trades paper fechados e ajusta política via `effective_min_edge`/multiplicadores.
+- `learning_store.py` registra todos os sinais/decisões em `logs/learning_events.jsonl` e outcomes posteriores em modo contra-factual.
+- `logs/learning_pending_signals.json` mantém sinais aguardando reobservação depois de `PAPER_LEARNING_OUTCOME_HORIZON_MINUTES`.
 
 ## Observações
 - Não há execução real de ordens; é paper trading.

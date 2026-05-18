@@ -23,6 +23,12 @@ import httpx
 
 from wallet import Wallet
 from learning import ensure_learning_state, maybe_refresh_policy, learning_snapshot
+from learning_store import (
+    new_cycle_id,
+    observe_signal_outcomes_from_signals,
+    record_signal_decisions,
+    summarize_learning_events,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polymarket-settlement")
@@ -574,6 +580,7 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
     """
     if wallet is None:
         wallet = Wallet()
+    cycle_id = new_cycle_id()
 
     # Import scanner
     base_dir = Path(__file__).resolve().parent
@@ -593,7 +600,14 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
         scan_result = await scan_all()
 
     # Phase 3: Execute top signals
-    signals = scan_result.get("signals", [])
+    all_signals = list(scan_result.get("signals", []) or [])
+    try:
+        outcome_summary = observe_signal_outcomes_from_signals(all_signals)
+    except Exception as e:
+        logger.warning("Learning signal outcome update failed: %s", e)
+        outcome_summary = {"enabled": True, "error": str(e), "outcome_events": 0, "pending": 0}
+
+    signals = list(all_signals)
     if PAPER_DISABLE_NEW_ENTRIES:
         top_signals = []
         actionable = []
@@ -601,6 +615,24 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
         skipped = [{"market_slug": "*", "reason": "entries paused by circuit breaker"}]
         status = wallet.get_status()
         learning_info = learning_snapshot(ensure_learning_state(wallet.state))
+        try:
+            decision_summary = record_signal_decisions(
+                cycle_id=cycle_id,
+                signals=all_signals,
+                selected_strategies=selected,
+                effective_min_edge=float(wallet.state.get("settings", {}).get("min_edge", 0.05) or 0.05),
+                accepted_signals=[],
+                policy_rejected=[],
+                top_signals=[],
+                executed=[],
+                skipped=skipped,
+                entries_paused=True,
+            )
+            store_summary = summarize_learning_events()
+            store_summary.update({"last_cycle_decisions": decision_summary, "last_cycle_outcomes": outcome_summary})
+        except Exception as e:
+            logger.warning("Learning signal decision recording failed: %s", e)
+            store_summary = {"error": str(e)}
         wallet.save()
         return {
             "settlement": settlement_report,
@@ -622,6 +654,7 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
             },
             "wallet": status,
             "learning": learning_info,
+            "learning_store": store_summary,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     max_per_scan = wallet.state.get("settings", {}).get("max_per_scan", 10)
@@ -725,6 +758,23 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
 
     status = wallet.get_status()
     learning_info = learning_snapshot(ls)
+    try:
+        decision_summary = record_signal_decisions(
+            cycle_id=cycle_id,
+            signals=all_signals,
+            selected_strategies=selected,
+            effective_min_edge=effective_min_edge,
+            accepted_signals=actionable,
+            policy_rejected=policy_rejected,
+            top_signals=top_signals,
+            executed=executed,
+            skipped=skipped,
+        )
+        store_summary = summarize_learning_events()
+        store_summary.update({"last_cycle_decisions": decision_summary, "last_cycle_outcomes": outcome_summary})
+    except Exception as e:
+        logger.warning("Learning signal decision recording failed: %s", e)
+        store_summary = {"error": str(e)}
     wallet.save()
 
     return {
@@ -754,6 +804,7 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
         },
         "wallet": status,
         "learning": learning_info,
+        "learning_store": store_summary,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -800,6 +851,16 @@ def format_report(report: Dict[str, Any]) -> str:
     lrn = report.get("learning", {})
     if lrn:
         lines.append(f"🧠 **Learning:** enabled={lrn.get('enabled')} shadow={lrn.get('shadow_mode')} eff_min_edge={float(lrn.get('effective_min_edge', 0)):.3f} conf={lrn.get('confidence', '-')}")
+    store = report.get("learning_store", {})
+    if store:
+        cycle_decisions = store.get("last_cycle_decisions", {}) if isinstance(store.get("last_cycle_decisions"), dict) else {}
+        cycle_outcomes = store.get("last_cycle_outcomes", {}) if isinstance(store.get("last_cycle_outcomes"), dict) else {}
+        lines.append(
+            "🧾 **Signal store:** "
+            f"decisions={int(cycle_decisions.get('decision_events', 0) or 0)} "
+            f"outcomes={int(cycle_outcomes.get('outcome_events', 0) or 0)} "
+            f"pending={int(cycle_decisions.get('pending', cycle_outcomes.get('pending', 0)) or 0)}"
+        )
 
     return "\n".join(lines)
 
