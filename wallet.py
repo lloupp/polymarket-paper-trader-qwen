@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+from learning import ensure_learning_state, build_trade_feature, append_trade_feature
 
 # ---------------------------------------------------------------------------
 # Default settings
@@ -26,6 +27,23 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "min_trade": 10,
     "max_per_scan": 10,
     "min_edge": 0.05,
+    "llm_enabled": False,
+    "llm_mode": "balanced",
+    "llm_url": "http://127.0.0.1:8080/v1/chat/completions",
+    "min_net_edge": 0.035,
+    "taker_fee_estimate": 0.001,
+    "slippage_estimate": 0.01,
+    "smart_money_max_spread": 0.03,
+    "smart_money_min_liquidity": 15000,
+    "smart_money_min_vol24h": 50000,
+    "event_countdown_max_spread": 0.06,
+    "event_countdown_min_liquidity": 15000,
+    "event_countdown_min_vol24h": 25000,
+    "btc_max_entry_price": 0.82,
+    "btc_min_liquidity": 1000,
+    "endgame_max_entry_price": 0.95,
+    "endgame_min_liquidity": 1500,
+    "shadow_strategies": "arbitrage,value,mean_reversion,volume_spike",
 }
 
 DEFAULT_STATE: Dict[str, Any] = {
@@ -35,6 +53,29 @@ DEFAULT_STATE: Dict[str, Any] = {
     "history": [],         # list of closed position dicts
     "cooldowns": {},       # market_slug -> ISO timestamp string
     "settings": DEFAULT_SETTINGS,
+    "learning_state": {
+        "version": 1,
+        "enabled": True,
+        "shadow_mode": False,
+        "min_samples": 20,
+        "aggressiveness": "medium",
+        "max_features": 1000,
+        "window_trades": 400,
+        "cooldown_cycles": 10,
+        "last_policy_cycle": 0,
+        "cycle_counter": 0,
+        "trades_features": [],
+        "strategy_stats": {},
+        "edge_buckets_stats": {},
+        "policy_recommendations": {
+            "effective_min_edge": 0.05,
+            "strategy_multipliers": {},
+            "confidence": "low",
+            "reasons": ["boot"],
+            "updated_at": None,
+        },
+        "last_updated_at": None,
+    },
 }
 
 class Wallet:
@@ -59,6 +100,11 @@ class Wallet:
             self.state = self._deep_copy(DEFAULT_STATE)
             self.save()
 
+        # Keep risk settings proportional to bankroll when enabled.
+        ensure_learning_state(self.state)
+        if self._apply_auto_risk_settings():
+            self.save()
+
     def save(self) -> None:
         """Persist current wallet state to the JSON file (atomic-ish write)."""
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -68,6 +114,45 @@ class Wallet:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, self.path)
+
+    def _apply_auto_risk_settings(self) -> bool:
+        """Auto-scale risk settings from bankroll. Enable with PAPER_AUTO_RISK=1 (default)."""
+        settings = dict(self.state.get("settings", {}))
+        auto_flag = settings.get("auto_risk_enabled")
+        if auto_flag is None:
+            auto_flag = os.getenv("PAPER_AUTO_RISK", "1") == "1"
+            settings["auto_risk_enabled"] = bool(auto_flag)
+            self.state["settings"] = settings
+        if not bool(auto_flag):
+            return False
+
+        bankroll = float(self.state.get("bankroll", 0.0) or 0.0)
+        if bankroll <= 0:
+            return False
+
+        settings = dict(self.state.get("settings", {}))
+
+        max_exposure = round(min(bankroll, max(10.0, bankroll * 0.60)), 2)
+        max_trade = round(min(max_exposure, max(2.0, bankroll * 0.08)), 2)
+        min_trade = round(min(max_trade, max(1.0, bankroll * 0.02)), 2)
+        max_per_scan = int(max(1, min(6, bankroll // 30 or 1)))
+
+        new_values = {
+            "max_exposure": max_exposure,
+            "max_trade": max_trade,
+            "min_trade": min_trade,
+            "max_per_scan": max_per_scan,
+        }
+
+        changed = False
+        for k, v in new_values.items():
+            if settings.get(k) != v:
+                settings[k] = v
+                changed = True
+
+        if changed:
+            self.state["settings"] = settings
+        return changed
 
     # ------------------------------------------------------------------
     # Status / info
@@ -106,13 +191,14 @@ class Wallet:
         Checks:
         1. Dedup – no duplicate market+side position already open.
         2. Cooldown – market must not be on cooldown.
-        3. Size bounds – min_trade <= size <= max_trade.
-        4. Exposure limit – new exposure must not exceed max_exposure.
-        5. Bankroll – must have sufficient available bankroll.
+        3. Stake bounds – min_trade <= size <= max_trade.
+        4. Exposure limit – new stake must not exceed max_exposure.
+        5. Bankroll – must have sufficient available cash.
 
-        Returns the new position d
-ict on success, raises ValueError on failure.
+        Returns the new position dict on success, raises ValueError on failure.
         """
+        if self._apply_auto_risk_settings():
+            self.save()
         settings = self.state.get("settings", DEFAULT_SETTINGS)
 
         # 1. Dedup check
@@ -124,7 +210,10 @@ ict on success, raises ValueError on failure.
         if self.is_on_cooldown(market_slug):
             raise ValueError(f"Market {market_slug} is on cooldown")
 
-        # 3. Size bounds
+        if price <= 0 or price > 1:
+            raise ValueError(f"Invalid entry price {price}; expected 0 < price <= 1")
+
+        # 3. Stake bounds. Public callers pass size as dollar stake, not shares.
         min_trade = settings.get("min_trade", DEFAULT_SETTINGS["min_trade"])
         max_trade = settings.get("max_trade", DEFAULT_SETTINGS["max_trade"])
         if size < min_trade:
@@ -135,17 +224,19 @@ ict on success, raises ValueError on failure.
         # 4. Exposure limit
         max_exposure = settings.get("max_exposure", DEFAULT_SETTINGS["max_exposure"])
         current_exposure = self.get_total_exposure()
-        if current_exposure + size > max_exposure:
+        cost = round(size, 6)
+        shares = round(cost / price, 8)
+        if current_exposure + cost > max_exposure:
             raise ValueError(
-                f"Trade would push exposure to {current_exposure + size}, "
+                f"Trade would push exposure to {current_exposure + cost}, "
                 f"exceeding max_exposure {max_exposure}"
             )
 
         # 5. Bankroll check
         available = self.get_available_bankroll()
-        if size > available:
+        if cost > available:
             raise ValueError(
-                f"Trade size {size} exceeds available bankroll {available}"
+                f"Trade size {cost} exceeds available bankroll {available}"
             )
 
         # Create position
@@ -156,8 +247,9 @@ ict on success, raises ValueError on failure.
             "market_slug": market_slug,
             "side": side,
             "entry_price": price,
-            "size": size,
-            "cost": round(price * size, 6),
+            "size": cost,
+            "shares": shares,
+            "cost": cost,
             "status": "open",
             "opened_at": now,
             "closed_at": None,
@@ -206,16 +298,20 @@ ict on success, raises ValueError on failure.
         pos["pnl_pct"] = round(pnl_pct, 6)
         pos["close_reason"] = reason or "manual"
 
-        # Return proceeds to bankroll
-        if pos["side"] == "YES":
-            proceeds = pos["size"] * close_price
-        else:
-            # NO side: profit = cost - (size * close_price)
-            proceeds = pos["cost"] + pnl
+        # Return side-price proceeds to cash. For legacy positions without
+        # shares, size was the share quantity; new positions persist shares.
+        shares = float(pos.get("shares", pos.get("size", 0.0)) or 0.0)
+        proceeds = shares * close_price
         self.state["bankroll"] = round(self.state["bankroll"] + proceeds, 6)
 
         # Move to history
         self.state.setdefault("history", []).append(pos)
+
+        # Learning feature row from closed simulated trade
+        ls = ensure_learning_state(self.state)
+        feat = build_trade_feature(pos, strategy_mode=str(self.state.get("last_strategy_mode") or "unknown"))
+        append_trade_feature(ls, feat)
+
         del self.state["positions"][position_id]
 
         # Add cooldown for this market
@@ -272,26 +368,25 @@ ict on success, raises ValueError on failure.
 
         Returns (pnl_absolute, pnl_pct) tuple.
 
-        YES side: value = size * current_price, cost = entry_price * size
-        NO  side: value = size * (1 - current_price), cost = 
-entry_price * size
-                  but since entry_price for NO = 1 - yes_price at entry,
-                  profit = cost - size * (1 - current_price) when price moves down.
-        
-        Simplified approach:
-        - YES: pnl = size * (current_price - entry_price)
-        - NO:  pnl = size * (entry_price - current_price)
+        current_price is always the side price for the position:
+        YES positions receive yes_price, NO positions receive no_price.
+
+        New positions store:
+        - size: dollar stake/cost
+        - shares: outcome shares bought
+
+        Legacy positions did not store shares, so size is used as a fallback
+        share quantity.
+
+        Formula for both sides:
+        - pnl = shares * (current_side_price - entry_side_price)
         - pnl_pct = pnl / cost
         """
-        size = position["size"]
-        entry_price = position["entry_price"]
-        cost = position["cost"]
+        shares = float(position.get("shares", position.get("size", 0.0)) or 0.0)
+        entry_price = float(position["entry_price"])
+        cost = float(position["cost"])
 
-        if position["side"] == "YES":
-            pnl = size * (current_price - entry_price)
-        else:  # NO
-            pnl = size * (entry_price - current_price)
-
+        pnl = shares * (current_price - entry_price)
         pnl_pct = round(pnl / cost, 8) if cost != 0 else 0.0
         return pnl, pnl_pct
 
@@ -353,8 +448,12 @@ urn remaining timedelta for a market's cooldown, or None if not on cooldown."""
         )
 
     def get_available_bankroll(self) -> float:
-        """Bankroll minus total exposure = capital available for new trades."""
-        return round(self.state["bankroll"] - self.get_total_exposure(), 6)
+        """Cash available for new trades.
+
+        Bankroll is already reduced by position cost when a trade opens, so
+        subtracting exposure here would double-count committed capital.
+        """
+        return round(self.state["bankroll"], 6)
 
     # ------------------------------------------------------------------
     # Query helpers
@@ -383,6 +482,10 @@ sition history (most recent first)."""
             for pos in self.state.get("history", [])
         )
 
+    def get_learning_state(self) -> Dict[str, Any]:
+        """Return learning state, guaranteeing defaults exist."""
+        return ensure_learning_state(self.state)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -398,4 +501,3 @@ sition history (most recent first)."""
             f"open={status['open_positions']}, "
             f"exposure={status['total_exposure']})"
         )
-

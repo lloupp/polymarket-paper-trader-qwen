@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from llama_cpp import Llama
@@ -9,23 +10,42 @@ PORT = int(os.getenv("LLM_PORT", "8080"))
 N_THREADS = int(os.getenv("LLM_THREADS", "8"))
 N_CTX = int(os.getenv("LLM_CTX", "2048"))
 
-print("Carregando FAST: Qwen2.5-0.5B q4_0...", flush=True)
-llm_fast = Llama.from_pretrained(
-    repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-    filename="qwen2.5-0.5b-instruct-q4_0.gguf",
-    n_ctx=N_CTX,
-    n_threads=N_THREADS,
-    verbose=False,
-)
-print("Carregando BALANCED: Qwen2.5-1.5B q4_0...", flush=True)
-llm_balanced = Llama.from_pretrained(
-    repo_id="Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-    filename="qwen2.5-1.5b-instruct-q4_0.gguf",
-    n_ctx=N_CTX,
-    n_threads=N_THREADS,
-    verbose=False,
-)
-print("Modelos carregados.", flush=True)
+MODEL_SPECS = {
+    "fast": {
+        "label": "Qwen2.5-0.5B q4_0",
+        "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "filename": "qwen2.5-0.5b-instruct-q4_0.gguf",
+    },
+    "balanced": {
+        "label": "Qwen2.5-1.5B q4_0",
+        "repo_id": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        "filename": "qwen2.5-1.5b-instruct-q4_0.gguf",
+    },
+    "strong": {
+        "label": "Qwen3-4B-Instruct-2507 Q4_K_M",
+        "repo_id": "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF",
+        "filename": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    },
+}
+_models = {}
+_model_lock = threading.Lock()
+
+
+def get_llm(mode: str):
+    normalized = mode if mode in MODEL_SPECS else "balanced"
+    with _model_lock:
+        if normalized not in _models:
+            spec = MODEL_SPECS[normalized]
+            print(f"Carregando {normalized.upper()}: {spec['label']}...", flush=True)
+            _models[normalized] = Llama.from_pretrained(
+                repo_id=spec["repo_id"],
+                filename=spec["filename"],
+                n_ctx=N_CTX,
+                n_threads=N_THREADS,
+                verbose=False,
+            )
+            print(f"Modelo {normalized} carregado.", flush=True)
+        return _models[normalized]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -42,7 +62,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"ok": True, "models": ["Qwen2.5-0.5B q4_0", "Qwen2.5-1.5B q4_0"]})
+            self._json(200, {
+                "ok": True,
+                "available_models": [spec["label"] for spec in MODEL_SPECS.values()],
+                "loaded_modes": sorted(_models.keys()),
+            })
         else:
             self._json(404, {"error": "not found"})
 
@@ -58,12 +82,13 @@ class Handler(BaseHTTPRequestHandler):
             max_tokens = int(req.get("max_tokens", 180))
             temperature = float(req.get("temperature", 0.7))
 
-            llm = llm_fast if mode == "fast" else llm_balanced
-            out = llm.create_chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+            llm = get_llm(mode)
+            with _model_lock:
+                out = llm.create_chat_completion(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
             self._json(200, out)
         except Exception as e:
             self._json(500, {"error": str(e)})

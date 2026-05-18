@@ -1,4 +1,4 @@
-"""Standalone async scanner — fetches Polymarket Gamma API and runs 5 strategies.
+"""Standalone async scanner — fetches Polymarket Gamma API and runs multiple strategies.
 
 Strategies:
   1. detect_arbitrage      — mutually-exclusive markets summing > 1 + min_profit
@@ -6,6 +6,8 @@ Strategies:
   3. detect_value_betting  — high vol near 50%, low liq+high vol, contrarian
   4. detect_volume_spikes  — vol/liq>3x or vol/cat_avg>3x
   5. detect_smart_money    — tight spread + high vol ratio
+  6. detect_event_countdown — markets near end-date with directional bias
+  7. detect_endgame_last_minute — BTC 5m last-minute directional sniper
 
 Usage:
   python scanner.py                # run scan_all and print summary
@@ -16,6 +18,7 @@ import json
 import logging
 import os
 import math
+import socket
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -38,6 +41,27 @@ logger = logging.getLogger("polymarket-scanner")
 # ---------------------------------------------------------------------------
 GAMMA_API = os.getenv("POLYMARKET_GAMMA_API", "https://gamma-api.polymarket.com")
 
+# WSL/local DNS can intermittently fail resolving Polymarket Cloudflare hosts.
+# Keep URL hostnames intact (TLS SNI still works) but bypass resolver failures
+# with the current Cloudflare A records unless explicitly disabled.
+POLYMARKET_STATIC_DNS = os.getenv("PAPER_POLYMARKET_STATIC_DNS", "0") == "1"
+POLYMARKET_STATIC_IP = os.getenv("PAPER_POLYMARKET_STATIC_IP", "104.18.34.205")
+_POLYMARKET_DNS_HOSTS = {"gamma-api.polymarket.com", "data-api.polymarket.com", "clob.polymarket.com"}
+_ORIG_GETADDRINFO = socket.getaddrinfo
+
+def _install_polymarket_dns_fallback() -> None:
+    if not POLYMARKET_STATIC_DNS or getattr(socket.getaddrinfo, "_polymarket_fallback", False):
+        return
+    def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        decoded = host.decode() if isinstance(host, (bytes, bytearray)) else host
+        if decoded in _POLYMARKET_DNS_HOSTS:
+            host = POLYMARKET_STATIC_IP
+        return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+    _patched_getaddrinfo._polymarket_fallback = True  # type: ignore[attr-defined]
+    socket.getaddrinfo = _patched_getaddrinfo
+
+_install_polymarket_dns_fallback()
+
 # Arbitrage
 ARB_MIN_PROFIT_PCT = 0.01   # 1% minimum arb profit
 ARB_MAX_PROFIT_PCT = 0.15   # 15% max — beyond this, almost certainly not mutually exclusive
@@ -48,6 +72,28 @@ ADVANCED_MIN_EDGE = 0.05    # 5% minimum edge to be actionable
 ADVANCED_KELLY_FRACTION = 0.25  # quarter-Kelly
 INITIAL_BANKROLL = 10000.0
 ADVANCED_MAX_TRADE_SIZE = 50.0
+
+# BTC 5-minute momentum/scalping, inspired by @ndjjwobaq public profile.
+# It enters only the current/near-current BTC Up/Down 5m market, usually
+# after the interval has started, and follows the side implied by live odds.
+BTC_5M_ENABLED = os.getenv("PAPER_BTC_5M_ENABLED", "1") == "1"
+BTC_5M_BASE_SIZE = float(os.getenv("PAPER_BTC_5M_BASE_SIZE", "50"))
+BTC_5M_MIN_SECONDS_IN = int(os.getenv("PAPER_BTC_5M_MIN_SECONDS_IN", "45"))
+BTC_5M_MAX_SECONDS_IN = int(os.getenv("PAPER_BTC_5M_MAX_SECONDS_IN", "305"))
+BTC_5M_MIN_DIRECTIONAL_EDGE = float(os.getenv("PAPER_BTC_5M_MIN_DIRECTIONAL_EDGE", "0.035"))
+BTC_5M_NORMAL_MAX_PRICE = float(os.getenv("PAPER_BTC_5M_NORMAL_MAX_PRICE", "0.72"))
+BTC_5M_LATE_CONFIRM_MIN_SECONDS = int(os.getenv("PAPER_BTC_5M_LATE_CONFIRM_MIN_SECONDS", "210"))
+BTC_5M_LATE_CONFIRM_MAX_PRICE = float(os.getenv("PAPER_BTC_5M_LATE_CONFIRM_MAX_PRICE", "0.99"))
+BTC_5M_MIN_LIQUIDITY = float(os.getenv("PAPER_BTC_5M_MIN_LIQUIDITY", "1000"))
+
+# BTC 5m Endgame (last-minute dedicated)
+ENDGAME_ENABLED = os.getenv("PAPER_ENDGAME_ENABLED", "1") == "1"
+ENDGAME_WINDOW_START_SECONDS = int(os.getenv("PAPER_ENDGAME_WINDOW_START_SECONDS", "240"))
+ENDGAME_WINDOW_END_SECONDS = int(os.getenv("PAPER_ENDGAME_WINDOW_END_SECONDS", "299"))
+ENDGAME_MIN_DIRECTIONAL_EDGE = float(os.getenv("PAPER_ENDGAME_MIN_DIRECTIONAL_EDGE", "0.06"))
+ENDGAME_MIN_LIQUIDITY = float(os.getenv("PAPER_ENDGAME_MIN_LIQUIDITY", "1500"))
+ENDGAME_MAX_ENTRY_PRICE = float(os.getenv("PAPER_ENDGAME_MAX_ENTRY_PRICE", "0.95"))
+ENDGAME_BASE_SIZE = float(os.getenv("PAPER_ENDGAME_BASE_SIZE", "35"))
 
 # Mean Reversion
 MEAN_REVERSION_THRESHOLD = 0.10   # 10% weekly move (primary)
@@ -66,6 +112,14 @@ VOLUME_SPIKE_MIN_VOL = 50000.0  # $50K 24h volume minimum
 SMART_MONEY_MAX_SPREAD = 0.05    # 5 cent spread (task spec); runtime default 0.01
 SMART_MONEY_VOLUME_RATIO = 2.0   # 2x category average
 SMART_MONEY_MIN_LIQUIDITY = 30000.0
+
+# Event Countdown
+EVENT_COUNTDOWN_MIN_HOURS = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN_HOURS", "0.25"))
+EVENT_COUNTDOWN_MAX_HOURS = float(os.getenv("PAPER_EVENT_COUNTDOWN_MAX_HOURS", "6"))
+EVENT_COUNTDOWN_MIN_LIQUIDITY = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN_LIQUIDITY", "15000"))
+EVENT_COUNTDOWN_MIN_VOL24H = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN_VOL24H", "25000"))
+EVENT_COUNTDOWN_MID_BAND = float(os.getenv("PAPER_EVENT_COUNTDOWN_MID_BAND", "0.07"))
+EVENT_COUNTDOWN_MAX_MODEL_BOOST = float(os.getenv("PAPER_EVENT_COUNTDOWN_MAX_MODEL_BOOST", "0.08"))
 
 # ---------------------------------------------------------------------------
 # Keyword heuristics for arbitrage non-exclusion filter
@@ -145,6 +199,9 @@ class Signal:
     confidence: float = 0.5
     kelly_fraction: float = 0.0
     suggested_size: float = 0.0
+    spread: float = 0.0
+    liquidity: float = 0.0
+    volume_24hr: float = 0.0
     reasoning: str = ""
     sources: List[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -170,6 +227,9 @@ class Signal:
             "confidence": round(self.confidence, 4),
             "kelly_fraction": round(self.kelly_fraction, 6),
             "suggested_size": round(self.suggested_size, 2),
+            "spread": round(self.spread, 4),
+            "liquidity": round(self.liquidity, 2),
+            "volume_24hr": round(self.volume_24hr, 2),
             "reasoning": self.reasoning,
             "sources": self.sources,
             "timestamp": self.timestamp.isoformat(),
@@ -319,30 +379,36 @@ async def _fetch_paginated(
     results: list = []
     async with httpx.AsyncClient(timeout=15.0, trust_env=True) as client:
         for page in range(pages):
-            try:
-                params = {"limit": limit, "offset": page * limit, **(extra_params or {})}
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-                if not data:
-                    break
-                results.extend(data)
-                await asyncio.sleep(0.3)  # 0.3s delay between pages
-            except Exception as e:
-                body_preview = ""
+            params = {"limit": limit, "offset": page * limit, **(extra_params or {})}
+            data = None
+            for attempt in range(3):
                 try:
-                    body_preview = (resp.text or "")[:160] if 'resp' in locals() else ""
-                except Exception:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except Exception as e:
                     body_preview = ""
+                    try:
+                        body_preview = (resp.text or "")[:160] if 'resp' in locals() else ""
+                    except Exception:
+                        body_preview = ""
 
-                if '503' in str(e) and ('Página bloqueada' in body_preview or '<html' in body_preview.lower()):
-                    logger.warning(
-                        "Gamma API bloqueada pela rede/origem (HTTP 503 + página de bloqueio). "
-                        "Troque de rede (VPN/4G/outro IP) ou configure proxy HTTP(S)."
-                    )
-                else:
-                    logger.warning("Gamma API fetch page %d failed: %s", page, e)
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        continue
+                    if '503' in str(e) and ('Página bloqueada' in body_preview or '<html' in body_preview.lower()):
+                        logger.warning(
+                            "Gamma API bloqueada pela rede/origem (HTTP 503 + página de bloqueio). "
+                            "Troque de rede (VPN/4G/outro IP) ou configure proxy HTTP(S)."
+                        )
+                    else:
+                        logger.warning("Gamma API fetch page %d failed after retries: %s", page, e)
+                    break
+            if not data:
                 break
+            results.extend(data)
+            await asyncio.sleep(0.3)  # 0.3s delay between pages
     return results
 
 async def fetch_gamma_markets(limit: int = 200, pages: int = 4) -> List[GammaMarket]:
@@ -541,6 +607,9 @@ async def detect_mean_reversion(markets: List[GammaMarket]) -> List[Signal]:
                 confidence=confidence,
                 kelly_fraction=kelly_frac,
                 suggested_size=size,
+                spread=m.spread,
+                liquidity=m.liquidity,
+                volume_24hr=m.volume_24hr,
                 reasoning=(
                     f"MEAN_REVERT [{change_label}]: {m.question[:55]} | "
                     f"{change_label} move:{price_change:+.1%} Mkt:{m.yes_price:.0%} "
@@ -631,6 +700,9 @@ async def detect_value_betting(markets: List[GammaMarket]) -> List[Signal]:
                 confidence=min(confidence, 0.85),
                 kelly_fraction=kelly_frac,
                 suggested_size=size,
+                spread=m.spread,
+                liquidity=m.liquidity,
+                volume_24hr=m.volume_24hr,
                 reasoning=(
                     f"VALUE [{signal_type}]: {m.question[:60]} | "
                     f"Mkt:{m.yes_price:.0%} Model:{model_prob:.0%} Edge:{edge:.1%} "
@@ -718,6 +790,9 @@ async def detect_volume_spikes(markets: List[GammaMarket]) -> List[Signal]:
                 confidence=confidence,
                 kelly_fraction=kelly_frac,
                 suggested_size=size,
+                spread=m.spread,
+                liquidity=m.liquidity,
+                volume_24hr=m.volume_24hr,
                 reasoning=(
                     f"VOL_SPIKE [{spike_type}]: {m.question[:60]} | "
                     f"Vol/Liq:{vol_liq_ratio:.1f}x CatAvg:{vol_vs_category:.1f}x "
@@ -814,6 +889,9 @@ async def detect_smart_money(markets: List[GammaMarket]) -> List[Signal]:
                 confidence=confidence,
                 kelly_fraction=kelly_frac,
                 suggested_size=size,
+                spread=m.spread,
+                liquidity=m.liquidity,
+                volume_24hr=m.volume_24hr,
                 reasoning=(
                     f"SMART_MONEY: {m.question[:60]} | "
                     f"Spread:{m.spread:.3f} VolRatio:{vol_ratio:.1f}x "
@@ -826,6 +904,318 @@ async def detect_smart_money(markets: List[GammaMarket]) -> List[Signal]:
 
     signals.sort(key=lambda s: s.confidence, reverse=True)
     logger.info("Smart Money: %d signals found", len(signals))
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Strategy 6: Event countdown (near resolution)
+# ---------------------------------------------------------------------------
+
+async def detect_event_countdown(markets: List[GammaMarket]) -> List[Signal]:
+    """Detect directional opportunities in markets near end-date.
+
+    Heuristic:
+      - event ends soon (within configured hour window)
+      - liquid/active enough to avoid dead books
+      - avoid near-50% indecision and extreme tails
+      - follow market-implied side with small confidence boost as expiry nears
+    """
+    signals: List[Signal] = []
+    now = datetime.now(timezone.utc)
+
+    for m in markets:
+        try:
+            if not m.end_date:
+                continue
+            if m.closed or not m.active:
+                continue
+            if m.liquidity < EVENT_COUNTDOWN_MIN_LIQUIDITY:
+                continue
+            if m.volume_24hr < EVENT_COUNTDOWN_MIN_VOL24H:
+                continue
+            if m.yes_price < 0.12 or m.yes_price > 0.88:
+                continue
+
+            hours_left = (m.end_date - now).total_seconds() / 3600.0
+            if hours_left < EVENT_COUNTDOWN_MIN_HOURS or hours_left > EVENT_COUNTDOWN_MAX_HOURS:
+                continue
+
+            # Skip indecision zone near 50%.
+            if abs(m.yes_price - 0.5) < EVENT_COUNTDOWN_MID_BAND:
+                continue
+
+            direction = "yes" if m.yes_price > 0.5 else "no"
+            market_anchor = m.yes_price if direction == "yes" else m.no_price
+
+            # Boost increases as end approaches.
+            urgency = 1.0 - (hours_left / max(EVENT_COUNTDOWN_MAX_HOURS, 0.1))
+            urgency = max(0.0, min(1.0, urgency))
+            boost = min(EVENT_COUNTDOWN_MAX_MODEL_BOOST, 0.03 + 0.05 * urgency)
+
+            model_prob = min(0.95, market_anchor + boost)
+            edge = model_prob - market_anchor
+            if edge < ADVANCED_MIN_EDGE:
+                continue
+
+            confidence = min(0.86, 0.45 + 0.30 * urgency + 0.15 * min(m.volume_24hr / 200000.0, 1.0))
+
+            # Convert back to YES-space probability expected by Signal schema.
+            yes_model_prob = model_prob if direction == "yes" else (1.0 - model_prob)
+
+            win_prob = model_prob
+            entry_price = m.yes_price if direction == "yes" else m.no_price
+            kelly_frac, size = kelly_size(win_prob, entry_price, conservative=0.6, max_fraction=0.035)
+            kelly_frac = max(kelly_frac, 0.0015)
+
+            signals.append(Signal(
+                strategy="event_countdown",
+                market_id=m.market_id,
+                event_slug=_slug_or_question(m),
+                event_title=_title_or_question(m),
+                direction=direction,
+                model_probability=yes_model_prob,
+                market_probability=m.yes_price,
+                edge=edge,
+                confidence=confidence,
+                kelly_fraction=kelly_frac,
+                suggested_size=size,
+                spread=m.spread,
+                liquidity=m.liquidity,
+                volume_24hr=m.volume_24hr,
+                reasoning=(
+                    f"COUNTDOWN: {m.question[:58]} | "
+                    f"T-{hours_left:.1f}h MktYES:{m.yes_price:.0%} "
+                    f"Dir:{direction.upper()} Edge:{edge:.1%}"
+                ),
+                sources=["gamma_api_markets", "event_countdown"],
+            ))
+        except Exception as e:
+            logger.debug("Event countdown failed for market %s: %s", m.market_id, e)
+
+    signals.sort(key=lambda s: s.confidence * s.edge, reverse=True)
+    logger.info("Event Countdown: %d signals found", len(signals))
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Strategy 7: BTC 5-minute momentum/scalping
+# ---------------------------------------------------------------------------
+
+def _btc_5m_start_ts_from_slug(slug: str) -> Optional[int]:
+    try:
+        if not slug.startswith("btc-updown-5m-"):
+            return None
+        return int(slug.rsplit("-", 1)[-1])
+    except (TypeError, ValueError):
+        return None
+
+async def fetch_btc_5m_events(window_before: int = 1, window_after: int = 2) -> List[Dict[str, Any]]:
+    """Fetch current and adjacent BTC Up/Down 5m events by deterministic slugs."""
+    if not BTC_5M_ENABLED:
+        return []
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    current_start = now_ts - (now_ts % 300)
+    slugs = [f"btc-updown-5m-{current_start + i * 300}" for i in range(-window_before, window_after + 1)]
+    events: List[Dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=12.0, trust_env=True) as client:
+        for slug in slugs:
+            for attempt in range(3):
+                try:
+                    resp = await client.get(f"{GAMMA_API}/events", params={"slug": slug})
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if isinstance(data, list) and data:
+                        events.append(data[0])
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(0.3 * (attempt + 1))
+                        continue
+                    logger.warning("BTC 5m fetch failed for %s after retries: %s", slug, e)
+            await asyncio.sleep(0.1)
+    return events
+
+async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) -> List[Signal]:
+    """Detect BTC 5m Up/Down momentum signals.
+
+    Observable @ndjjwobaq-like pattern implemented for paper trading:
+    - only BTC Up/Down 5-minute markets;
+    - enter after the interval begins, not before;
+    - follow the side whose Polymarket live probability has moved away from 50/50;
+    - prefer 0.30-0.72 entry prices, with optional late-confirmation up to 0.99;
+    - BUY-only paper entry and hold/settle via the existing deterministic settlement.
+    """
+    signals: List[Signal] = []
+    if not BTC_5M_ENABLED:
+        return signals
+    if events is None:
+        events = await fetch_btc_5m_events()
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    for event in events:
+        try:
+            slug = str(event.get("slug") or "")
+            if not slug.startswith("btc-updown-5m-"):
+                continue
+            start_ts = _btc_5m_start_ts_from_slug(slug)
+            if start_ts is None:
+                continue
+            seconds_in = now_ts - start_ts
+            if seconds_in < BTC_5M_MIN_SECONDS_IN or seconds_in > BTC_5M_MAX_SECONDS_IN:
+                continue
+            if bool(event.get("closed", False)) or not bool(event.get("active", True)):
+                continue
+            markets = event.get("markets") or []
+            if not markets:
+                continue
+            raw_market = markets[0]
+            m = _parse_market(raw_market)
+            if not m or m.closed or not m.active:
+                continue
+            if m.liquidity < BTC_5M_MIN_LIQUIDITY:
+                continue
+            directional_edge = abs(m.yes_price - 0.5)
+            if directional_edge < BTC_5M_MIN_DIRECTIONAL_EDGE:
+                continue
+
+            direction = "yes" if m.yes_price > m.no_price else "no"
+            entry_price = m.yes_price if direction == "yes" else m.no_price
+            if entry_price <= 0 or entry_price >= 1:
+                continue
+            normal_entry = entry_price <= BTC_5M_NORMAL_MAX_PRICE
+            late_confirm = seconds_in >= BTC_5M_LATE_CONFIRM_MIN_SECONDS and entry_price <= BTC_5M_LATE_CONFIRM_MAX_PRICE
+            if not normal_entry and not late_confirm:
+                continue
+
+            # Model probability is intentionally modest: odds are the signal, but
+            # this is a very short-horizon binary trade with high variance.
+            time_score = max(0.0, min(1.0, seconds_in / 300.0))
+            model_win_prob = min(0.95, entry_price + 0.06 + directional_edge * 0.55 + max(0.0, time_score - 0.55) * 0.08)
+            edge = max(0.0, model_win_prob - entry_price)
+            confidence = min(0.88, 0.48 + directional_edge * 1.8 + min(m.volume_24hr / 5000.0, 0.12) + time_score * 0.08)
+            # More aggressive than the old generic strategies but still capped by wallet max_trade.
+            size_multiplier = 0.70 + min(directional_edge / 0.20, 1.0) * 0.60
+            suggested_size = min(ADVANCED_MAX_TRADE_SIZE, BTC_5M_BASE_SIZE * size_multiplier)
+            kelly_frac = min(0.05, suggested_size / max(INITIAL_BANKROLL, 1.0))
+            side_label = "UP" if direction == "yes" else "DOWN"
+            entry_mode = "late_confirm" if late_confirm and not normal_entry else "momentum"
+
+            signals.append(Signal(
+                strategy="btc_5m_momentum",
+                market_id=m.market_id,
+                event_slug=slug,
+                event_title=str(event.get("title") or m.question),
+                direction=direction,
+                model_probability=model_win_prob if direction == "yes" else 1.0 - model_win_prob,
+                market_probability=m.yes_price,
+                edge=edge,
+                confidence=confidence,
+                kelly_fraction=kelly_frac,
+                suggested_size=suggested_size,
+                spread=m.spread,
+                liquidity=m.liquidity,
+                volume_24hr=m.volume_24hr,
+                reasoning=(
+                    f"BTC_5M_{entry_mode}: BUY {side_label} aos {seconds_in}s/300s | "
+                    f"Up:{m.yes_price:.1%} Down:{m.no_price:.1%} entry:{entry_price:.1%} "
+                    f"edge:{edge:.1%} liq:${m.liquidity:,.0f} vol24h:${m.volume_24hr:,.0f}"
+                ),
+                sources=["gamma_api_btc_5m", "ndjjwobaq_profile_inspired"],
+            ))
+        except Exception as e:
+            logger.debug("BTC 5m momentum failed for event: %s", e)
+
+    signals.sort(key=lambda s: s.confidence * abs(s.edge), reverse=True)
+    logger.info("BTC 5m Momentum: %d signals found", len(signals))
+    return signals
+
+
+async def detect_endgame_last_minute(events: Optional[List[Dict[str, Any]]] = None) -> List[Signal]:
+    """Dedicated endgame strategy for BTC 5m markets in the final minute.
+
+    Trades only inside [ENDGAME_WINDOW_START_SECONDS, ENDGAME_WINDOW_END_SECONDS]
+    using stronger directional imbalance and tighter liquidity constraints.
+    """
+    signals: List[Signal] = []
+    if not ENDGAME_ENABLED:
+        return signals
+    if events is None:
+        events = await fetch_btc_5m_events()
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    for event in events:
+        try:
+            slug = str(event.get("slug") or "")
+            if not slug.startswith("btc-updown-5m-"):
+                continue
+            start_ts = _btc_5m_start_ts_from_slug(slug)
+            if start_ts is None:
+                continue
+
+            seconds_in = now_ts - start_ts
+            if seconds_in < ENDGAME_WINDOW_START_SECONDS or seconds_in > ENDGAME_WINDOW_END_SECONDS:
+                continue
+            if bool(event.get("closed", False)) or not bool(event.get("active", True)):
+                continue
+
+            markets = event.get("markets") or []
+            if not markets:
+                continue
+            m = _parse_market(markets[0])
+            if not m or m.closed or not m.active:
+                continue
+            if m.liquidity < ENDGAME_MIN_LIQUIDITY:
+                continue
+
+            directional_edge = abs(m.yes_price - 0.5)
+            if directional_edge < ENDGAME_MIN_DIRECTIONAL_EDGE:
+                continue
+
+            direction = "yes" if m.yes_price > m.no_price else "no"
+            entry_price = m.yes_price if direction == "yes" else m.no_price
+            if entry_price <= 0 or entry_price >= ENDGAME_MAX_ENTRY_PRICE:
+                continue
+
+            time_left = max(1, 300 - seconds_in)
+            urgency = 1.0 - (time_left / 60.0)  # 0..1 over final minute
+            urgency = max(0.0, min(1.0, urgency))
+            model_win_prob = min(0.985, entry_price + 0.05 + directional_edge * 0.70 + urgency * 0.06)
+            edge = max(0.0, model_win_prob - entry_price)
+            if edge < ADVANCED_MIN_EDGE:
+                continue
+
+            confidence = min(0.93, 0.56 + directional_edge * 1.6 + urgency * 0.18)
+            size_mult = 0.9 + min(directional_edge / 0.18, 1.0) * 0.5
+            suggested_size = min(ADVANCED_MAX_TRADE_SIZE, ENDGAME_BASE_SIZE * size_mult)
+            kelly_frac = min(0.06, suggested_size / max(INITIAL_BANKROLL, 1.0))
+
+            signals.append(Signal(
+                strategy="endgame_last_minute",
+                market_id=m.market_id,
+                event_slug=slug,
+                event_title=str(event.get("title") or m.question),
+                direction=direction,
+                model_probability=model_win_prob if direction == "yes" else 1.0 - model_win_prob,
+                market_probability=m.yes_price,
+                edge=edge,
+                confidence=confidence,
+                kelly_fraction=kelly_frac,
+                suggested_size=suggested_size,
+                spread=m.spread,
+                liquidity=m.liquidity,
+                volume_24hr=m.volume_24hr,
+                reasoning=(
+                    f"ENDGAME_LAST_MINUTE: {seconds_in}s/300s | left:{time_left}s "
+                    f"dir:{direction.upper()} up:{m.yes_price:.1%} down:{m.no_price:.1%} "
+                    f"edge:{edge:.1%} liq:${m.liquidity:,.0f}"
+                ),
+                sources=["gamma_api_btc_5m", "endgame_last_minute"],
+            ))
+        except Exception as e:
+            logger.debug("Endgame last-minute failed for event: %s", e)
+
+    signals.sort(key=lambda s: s.confidence * abs(s.edge), reverse=True)
+    logger.info("Endgame Last-Minute: %d signals found", len(signals))
     return signals
 
 # ---------------------------------------------------------------------------
@@ -862,18 +1252,26 @@ async def scan_all() -> Dict[str, Any]:
         logger.error("Failed to fetch Gamma events: %s", e)
         events = []
 
+    try:
+        btc_5m_events = await fetch_btc_5m_events()
+    except Exception as e:
+        logger.error("Failed to fetch BTC 5m events: %s", e)
+        btc_5m_events = []
+
     total_markets = len(markets)
     logger.info("Fetched %d markets, %d events", total_markets, len(events))
 
     # Run strategies (each wrapped in try/except)
     all_signals: List[Signal] = []
     strategy_funcs: List[Tuple[str, Any]] = [
+        ("BTC 5m Momentum", lambda: detect_btc_5m_momentum(btc_5m_events)),
+        ("Endgame Last-Minute", lambda: detect_endgame_last_minute(btc_5m_events)),
         ("Arbitrage", lambda: detect_arbitrage(events)),
         ("Value", lambda: detect_value_betting(markets)),
         ("Mean Reversion", lambda: detect_mean_reversion(markets)),
         ("Volume Spike", lambda: detect_volume_spikes(markets)),
-        ("Smart Money", lambda: detect_smart_money
-(markets)),
+        ("Smart Money", lambda: detect_smart_money(markets)),
+        ("Event Countdown", lambda: detect_event_countdown(markets)),
     ]
     for name, fn in strategy_funcs:
         try:
@@ -906,6 +1304,29 @@ async def scan_all() -> Dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
+async def scan_btc_5m_only() -> Dict[str, Any]:
+    """Fast scan for only the BTC 5-minute momentum strategy."""
+    logger.info("=" * 50)
+    logger.info("BTC 5M MOMENTUM SCAN: Fetching current BTC Up/Down markets...")
+    try:
+        btc_5m_events = await fetch_btc_5m_events()
+    except Exception as e:
+        logger.error("Failed to fetch BTC 5m events: %s", e)
+        btc_5m_events = []
+    signals = await detect_btc_5m_momentum(btc_5m_events)
+    actionable = [s for s in signals if s.passes_threshold]
+    logger.info("BTC 5M SCAN COMPLETE: %d total signals, %d actionable", len(signals), len(actionable))
+    logger.info("=" * 50)
+    return {
+        "total_markets": len(btc_5m_events),
+        "total_events": len(btc_5m_events),
+        "total_signals": len(signals),
+        "actionable_signals": len(actionable),
+        "signals": [s.to_dict() for s in signals],
+        "by_strategy": {"btc_5m_momentum": len(signals)} if signals else {},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -931,4 +1352,3 @@ if __name__ == "__main__":
                 print(f"    {s['reasoning'][:120]}")
 
     asyncio.run(_main())
-

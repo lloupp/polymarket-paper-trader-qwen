@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import socket
 import sys
 from pathlib import Path
 
@@ -20,23 +22,126 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from wallet import Wallet
+from learning import ensure_learning_state, maybe_refresh_policy, learning_snapshot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polymarket-settlement")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
+POLYMARKET_STATIC_DNS = os.getenv("PAPER_POLYMARKET_STATIC_DNS", "0") == "1"
+POLYMARKET_STATIC_IP = os.getenv("PAPER_POLYMARKET_STATIC_IP", "104.18.34.205")
+_POLYMARKET_DNS_HOSTS = {"gamma-api.polymarket.com", "data-api.polymarket.com", "clob.polymarket.com"}
+_ORIG_GETADDRINFO = socket.getaddrinfo
+
+def _install_polymarket_dns_fallback() -> None:
+    if not POLYMARKET_STATIC_DNS or getattr(socket.getaddrinfo, "_polymarket_fallback", False):
+        return
+    def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        decoded = host.decode() if isinstance(host, (bytes, bytearray)) else host
+        if decoded in _POLYMARKET_DNS_HOSTS:
+            host = POLYMARKET_STATIC_IP
+        return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+    _patched_getaddrinfo._polymarket_fallback = True  # type: ignore[attr-defined]
+    socket.getaddrinfo = _patched_getaddrinfo
+
+_install_polymarket_dns_fallback()
+
 LLM_PAPER_ENABLED = os.getenv("PAPER_LLM_ENABLED", "0") == "1"
 LLM_PAPER_URL = os.getenv("PAPER_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
 LLM_PAPER_MODE = os.getenv("PAPER_LLM_MODE", "balanced")
+PAPER_DISABLE_NEW_ENTRIES = os.getenv("PAPER_DISABLE_NEW_ENTRIES", "0") == "1"
 
 OSINT_GOOGLE_NEWS_ENABLED = os.getenv("PAPER_OSINT_GOOGLE_NEWS_ENABLED", "0") == "1"
 OSINT_GOOGLE_NEWS_WINDOW_HOURS = int(os.getenv("PAPER_OSINT_GOOGLE_NEWS_WINDOW_HOURS", "24"))
 OSINT_GOOGLE_NEWS_MAX_ARTICLES = int(os.getenv("PAPER_OSINT_GOOGLE_NEWS_MAX_ARTICLES", "8"))
 OSINT_GOOGLE_NEWS_BONUS_CAP = float(os.getenv("PAPER_OSINT_GOOGLE_NEWS_BONUS_CAP", "0.03"))
+WALLET_BACKUP_ENABLED = os.getenv("PAPER_WALLET_BACKUP_ENABLED", "1") == "1"
+WALLET_BACKUP_RETENTION = int(os.getenv("PAPER_WALLET_BACKUP_RETENTION", "48"))
+
+# Accepts: 'all', single strategy, or comma-separated strategies.
+RECOMMENDED_STRATEGY_MODE = "btc_5m_momentum,endgame_last_minute,smart_money,event_countdown"
+PAPER_STRATEGY_MODE = os.getenv("PAPER_STRATEGY_MODE", RECOMMENDED_STRATEGY_MODE).strip().lower()
+PAPER_MIN_NET_EDGE = float(os.getenv("PAPER_MIN_NET_EDGE", "0.035"))
+PAPER_TAKER_FEE_ESTIMATE = float(os.getenv("PAPER_TAKER_FEE_ESTIMATE", "0.001"))
+PAPER_SLIPPAGE_ESTIMATE = float(os.getenv("PAPER_SLIPPAGE_ESTIMATE", "0.01"))
+PAPER_SMART_MONEY_MAX_SPREAD = float(os.getenv("PAPER_SMART_MONEY_MAX_SPREAD", "0.03"))
+PAPER_SMART_MONEY_MIN_LIQUIDITY = float(os.getenv("PAPER_SMART_MONEY_MIN_LIQUIDITY", "15000"))
+PAPER_SMART_MONEY_MIN_VOL24H = float(os.getenv("PAPER_SMART_MONEY_MIN_VOL24H", "50000"))
+PAPER_EVENT_COUNTDOWN_MAX_SPREAD = float(os.getenv("PAPER_EVENT_COUNTDOWN_MAX_SPREAD", "0.06"))
+PAPER_EVENT_COUNTDOWN_MIN_LIQUIDITY = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN_LIQUIDITY_EXEC", "15000"))
+PAPER_EVENT_COUNTDOWN_MIN_VOL24H = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN_VOL24H_EXEC", "25000"))
+PAPER_BTC_MAX_ENTRY_PRICE_EXEC = float(os.getenv("PAPER_BTC_MAX_ENTRY_PRICE_EXEC", "0.82"))
+PAPER_BTC_MIN_LIQUIDITY_EXEC = float(os.getenv("PAPER_BTC_MIN_LIQUIDITY_EXEC", "1000"))
+PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC = float(os.getenv("PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC", "0.95"))
+PAPER_ENDGAME_MIN_LIQUIDITY_EXEC = float(os.getenv("PAPER_ENDGAME_MIN_LIQUIDITY_EXEC", "1500"))
+PAPER_SHADOW_STRATEGIES = os.getenv("PAPER_SHADOW_STRATEGIES", "arbitrage,value,mean_reversion,volume_spike")
+KNOWN_STRATEGIES = {
+    "btc_5m_momentum",
+    "endgame_last_minute",
+    "arbitrage",
+    "value",
+    "mean_reversion",
+    "volume_spike",
+    "smart_money",
+    "event_countdown",
+}
+BTC_ALIASES = {"btc_5m", "btc_5m_momentum", "ndjjwobaq"}
+
+DEFAULT_EXECUTION_POLICY = {
+    "min_net_edge": PAPER_MIN_NET_EDGE,
+    "taker_fee_estimate": PAPER_TAKER_FEE_ESTIMATE,
+    "slippage_estimate": PAPER_SLIPPAGE_ESTIMATE,
+    "smart_money_max_spread": PAPER_SMART_MONEY_MAX_SPREAD,
+    "smart_money_min_liquidity": PAPER_SMART_MONEY_MIN_LIQUIDITY,
+    "smart_money_min_vol24h": PAPER_SMART_MONEY_MIN_VOL24H,
+    "event_countdown_max_spread": PAPER_EVENT_COUNTDOWN_MAX_SPREAD,
+    "event_countdown_min_liquidity": PAPER_EVENT_COUNTDOWN_MIN_LIQUIDITY,
+    "event_countdown_min_vol24h": PAPER_EVENT_COUNTDOWN_MIN_VOL24H,
+    "btc_max_entry_price": PAPER_BTC_MAX_ENTRY_PRICE_EXEC,
+    "btc_min_liquidity": PAPER_BTC_MIN_LIQUIDITY_EXEC,
+    "endgame_max_entry_price": PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC,
+    "endgame_min_liquidity": PAPER_ENDGAME_MIN_LIQUIDITY_EXEC,
+    "shadow_strategies": PAPER_SHADOW_STRATEGIES,
+}
 
 
-async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> List[Dict[str, Any]]:
+def _selected_strategies(raw: str) -> set[str]:
+    v = (raw or '').strip().lower()
+    if not v or v == 'all':
+        return set(KNOWN_STRATEGIES)
+    parts = [p.strip() for p in v.replace(';', ',').split(',') if p.strip()]
+    selected = set()
+    for p in parts:
+        if p in BTC_ALIASES:
+            selected.add('btc_5m_momentum')
+        elif p in KNOWN_STRATEGIES:
+            selected.add(p)
+    return selected or {'btc_5m_momentum'}
+
+
+def execution_policy_from_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    policy = dict(DEFAULT_EXECUTION_POLICY)
+    for key, default in DEFAULT_EXECUTION_POLICY.items():
+        if key not in settings:
+            continue
+        if key == "shadow_strategies":
+            policy[key] = str(settings.get(key) or "")
+        else:
+            try:
+                policy[key] = float(settings.get(key, default))
+            except (TypeError, ValueError):
+                policy[key] = default
+    return policy
+
+
+async def llm_select_signals(
+    signals: List[Dict[str, Any]],
+    max_pick: int,
+    *,
+    mode: str = LLM_PAPER_MODE,
+    url: str = LLM_PAPER_URL,
+) -> List[Dict[str, Any]]:
     """Use local small LLM (OpenAI-compatible endpoint) to rank/select paper-trades.
     Falls back to heuristic ordering on any failure.
     """
@@ -66,7 +171,7 @@ async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> Li
     )
 
     payload = {
-        "mode": LLM_PAPER_MODE,
+        "mode": mode,
         "messages": [
             {"role": "system", "content": "Responda em JSON válido estrito, sem texto extra."},
             {"role": "user", "content": prompt + "\nSINAIS:\n" + json.dumps(compact, ensure_ascii=False)},
@@ -77,7 +182,7 @@ async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> Li
 
     try:
         async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-            resp = await client.post(LLM_PAPER_URL, json=payload)
+            resp = await client.post(url, json=payload)
             resp.raise_for_status()
             data = resp.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -109,7 +214,7 @@ async def llm_select_signals(signals: List[Dict[str, Any]], max_pick: int) -> Li
 def score_signal(signal: Dict[str, Any]) -> float:
     """Composite score for ranking candidate paper orders."""
     confidence = float(signal.get("confidence", 0.0) or 0.0)
-    edge = abs(float(signal.get("edge", 0.0) or 0.0))
+    edge = abs(float(signal.get("net_edge", signal.get("edge", 0.0)) or 0.0))
     spread = float(signal.get("spread", 0.0) or 0.0)
     liquidity = float(signal.get("liquidity", 0.0) or 0.0)
     market_probability = float(signal.get("market_probability", 0.5) or 0.5)
@@ -125,6 +230,93 @@ def score_signal(signal: Dict[str, Any]) -> float:
         - (0.10 * spread_penalty)
         - (0.05 * extremeness_penalty)
     )
+
+
+def entry_price_for_signal(signal: Dict[str, Any]) -> float:
+    direction = str(signal.get("direction", "yes") or "yes").lower()
+    market_probability = float(signal.get("market_probability", 0.5) or 0.5)
+    return 1.0 - market_probability if direction == "no" else market_probability
+
+
+def apply_execution_filters(signals: List[Dict[str, Any]], policy: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Apply final execution filters that are stricter than scanner discovery."""
+    accepted: List[Dict[str, Any]] = []
+    rejected: List[Dict[str, Any]] = []
+    min_net_edge = float(policy.get("min_net_edge", PAPER_MIN_NET_EDGE) or PAPER_MIN_NET_EDGE)
+    taker_fee_estimate = float(policy.get("taker_fee_estimate", PAPER_TAKER_FEE_ESTIMATE) or 0.0)
+    slippage_estimate = float(policy.get("slippage_estimate", PAPER_SLIPPAGE_ESTIMATE) or 0.0)
+    shadow_strategies = {
+        s.strip()
+        for s in str(policy.get("shadow_strategies", PAPER_SHADOW_STRATEGIES) or "").split(",")
+        if s.strip()
+    }
+
+    for signal in signals:
+        s = dict(signal)
+        strategy = str(s.get("strategy") or "")
+        direction = str(s.get("direction", "yes") or "yes").lower()
+        if direction not in {"yes", "no"}:
+            rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": f"unsupported direction: {direction}"})
+            continue
+
+        spread = max(0.0, float(s.get("spread", 0.0) or 0.0))
+        liquidity = float(s.get("liquidity", 0.0) or 0.0)
+        volume_24hr = float(s.get("volume_24hr", 0.0) or 0.0)
+        gross_edge = abs(float(s.get("edge", 0.0) or 0.0))
+        cost_estimate = min(0.20, spread + taker_fee_estimate + slippage_estimate)
+        net_edge = gross_edge - cost_estimate
+        s["execution_cost_estimate"] = round(cost_estimate, 4)
+        s["net_edge"] = round(net_edge, 4)
+
+        if net_edge < min_net_edge:
+            rejected.append({
+                "market_slug": s.get("event_slug", ""),
+                "strategy": strategy,
+                "reason": f"net_edge {net_edge:.3f} below {min_net_edge:.3f}",
+            })
+            continue
+
+        if strategy == "smart_money":
+            if spread > float(policy.get("smart_money_max_spread", PAPER_SMART_MONEY_MAX_SPREAD)):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": f"spread {spread:.3f} above smart_money max"})
+                continue
+            if (
+                liquidity < float(policy.get("smart_money_min_liquidity", PAPER_SMART_MONEY_MIN_LIQUIDITY))
+                or volume_24hr < float(policy.get("smart_money_min_vol24h", PAPER_SMART_MONEY_MIN_VOL24H))
+            ):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": "smart_money liquidity/volume below execution threshold"})
+                continue
+        elif strategy == "event_countdown":
+            if spread > float(policy.get("event_countdown_max_spread", PAPER_EVENT_COUNTDOWN_MAX_SPREAD)):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": f"spread {spread:.3f} above event_countdown max"})
+                continue
+            if (
+                liquidity < float(policy.get("event_countdown_min_liquidity", PAPER_EVENT_COUNTDOWN_MIN_LIQUIDITY))
+                or volume_24hr < float(policy.get("event_countdown_min_vol24h", PAPER_EVENT_COUNTDOWN_MIN_VOL24H))
+            ):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": "event_countdown liquidity/volume below execution threshold"})
+                continue
+        elif strategy == "btc_5m_momentum":
+            if entry_price_for_signal(s) > float(policy.get("btc_max_entry_price", PAPER_BTC_MAX_ENTRY_PRICE_EXEC)):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": "btc entry price above execution max"})
+                continue
+            if liquidity < float(policy.get("btc_min_liquidity", PAPER_BTC_MIN_LIQUIDITY_EXEC)):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": "btc liquidity below execution threshold"})
+                continue
+        elif strategy == "endgame_last_minute":
+            if entry_price_for_signal(s) > float(policy.get("endgame_max_entry_price", PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC)):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": "endgame entry price above execution max"})
+                continue
+            if liquidity < float(policy.get("endgame_min_liquidity", PAPER_ENDGAME_MIN_LIQUIDITY_EXEC)):
+                rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": "endgame liquidity below execution threshold"})
+                continue
+        if strategy in shadow_strategies:
+            rejected.append({"market_slug": s.get("event_slug", ""), "strategy": strategy, "reason": "strategy is configured as shadow-only"})
+            continue
+
+        accepted.append(s)
+
+    return accepted, rejected
 
 
 def select_best_orders(signals: List[Dict[str, Any]], max_pick: int) -> List[Dict[str, Any]]:
@@ -162,8 +354,15 @@ async def _google_news_count(query: str, *, window_hours: int, max_articles: int
     count = 0
     try:
         async with httpx.AsyncClient(timeout=12.0, trust_env=False) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
+            for attempt in range(3):
+                try:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(0.4 * (attempt + 1))
         root = ET.fromstring(resp.text)
         for item in root.findall("./channel/item"):
             pub = (item.findtext("pubDate") or "").strip()
@@ -214,8 +413,15 @@ async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]
     async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
         for mid in market_ids:
             try:
-                resp = await client.get(f"{GAMMA_API}/markets/{mid}")
-                resp.raise_for_status()
+                for attempt in range(3):
+                    try:
+                        resp = await client.get(f"{GAMMA_API}/markets/{mid}")
+                        resp.raise_for_status()
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.4 * (attempt + 1))
                 data = resp.json()
 
                 yes_price, no_price = 0.5, 0.5
@@ -244,6 +450,31 @@ async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]
                 logger.warning("Failed to fetch price for market %s: %s", mid, e)
                 results[mid] = {"yes_price": 0.5, "no_price": 0.5, "closed": False, "resolved": False, "question": ""}
     return results
+
+
+def backup_wallet_file() -> Optional[Path]:
+    """Create a pre-cycle wallet snapshot with bounded local retention."""
+    if not WALLET_BACKUP_ENABLED:
+        return None
+
+    base_dir = Path(__file__).resolve().parent
+    wallet_file = base_dir / "wallet.json"
+    if not wallet_file.exists():
+        return None
+
+    backup_dir = base_dir / "logs" / "wallet_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = backup_dir / f"wallet-{ts}.json"
+    shutil.copy2(wallet_file, target)
+
+    backups = sorted(backup_dir.glob("wallet-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[max(0, WALLET_BACKUP_RETENTION):]:
+        try:
+            old.unlink()
+        except OSError:
+            logger.warning("Failed to remove old wallet backup: %s", old)
+    return target
 
 def get_current_price(position: Dict[str, Any], market_data: Dict[str, Any]) -> float:
     """Get the current price relevant to a position's side."""
@@ -347,40 +578,109 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
     # Import scanner
     base_dir = Path(__file__).resolve().parent
     sys.path.insert(0, str(base_dir))
-    from scanner import scan_all
+    from scanner import scan_all, scan_btc_5m_only
 
     # Phase 1: Settle existing positions first
     settlement_report = await settle_positions(wallet)
 
+    selected = _selected_strategies(PAPER_STRATEGY_MODE)
+    btc_only = selected == {'btc_5m_momentum'}
+
     # Phase 2: Scan for new signals
-    scan_result = await scan_all()
+    if btc_only:
+        scan_result = await scan_btc_5m_only()
+    else:
+        scan_result = await scan_all()
 
     # Phase 3: Execute top signals
     signals = scan_result.get("signals", [])
+    if PAPER_DISABLE_NEW_ENTRIES:
+        top_signals = []
+        actionable = []
+        executed = []
+        skipped = [{"market_slug": "*", "reason": "entries paused by circuit breaker"}]
+        status = wallet.get_status()
+        learning_info = learning_snapshot(ensure_learning_state(wallet.state))
+        wallet.save()
+        return {
+            "settlement": settlement_report,
+            "scan": {
+                "total_markets": scan_result.get("total_markets", 0),
+                "total_signals": scan_result.get("total_signals", 0),
+                "actionable_signals": 0,
+                "by_strategy": scan_result.get("by_strategy", {}),
+                "strategy_mode": PAPER_STRATEGY_MODE,
+                "min_edge_base": wallet.state.get("settings", {}).get("min_edge", 0.05),
+                "min_edge_effective": wallet.state.get("settings", {}).get("min_edge", 0.05),
+            },
+            "execution": {
+                "attempted": 0,
+                "executed": 0,
+                "skipped": 1,
+                "trades": [],
+                "skipped_reasons": skipped,
+            },
+            "wallet": status,
+            "learning": learning_info,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     max_per_scan = wallet.state.get("settings", {}).get("max_per_scan", 10)
     min_edge = wallet.state.get("settings", {}).get("min_edge", 0.05)
     min_trade = wallet.state.get("settings", {}).get("min_trade", 10)
     max_trade = wallet.state.get("settings", {}).get("max_trade", 50)
+    execution_policy = execution_policy_from_settings(wallet.state.get("settings", {}))
+    settings = wallet.state.get("settings", {})
+    llm_enabled = bool(settings.get("llm_enabled", LLM_PAPER_ENABLED))
+    llm_mode = str(settings.get("llm_mode", LLM_PAPER_MODE) or LLM_PAPER_MODE)
+    llm_url = str(settings.get("llm_url", LLM_PAPER_URL) or LLM_PAPER_URL)
 
-    # Filter actionable signals
-    actionable = [s for s in signals if abs(s.get("edge", 0)) >= min_edge]
-    # Enrich with OSINT (deterministic) before final ordering/selection
-    actionable = await apply_osint_google_news(actionable)
+    # Learning policy (auto-adjust filters and ranking)
+    wallet.state["last_strategy_mode"] = PAPER_STRATEGY_MODE
+    ls = ensure_learning_state(wallet.state)
+    policy = maybe_refresh_policy(ls, wallet.state.get("settings", {}))
+    learning_enabled = bool(ls.get("enabled", True))
+    learning_shadow = bool(ls.get("shadow_mode", False))
+    effective_min_edge = float(policy.get("effective_min_edge", min_edge) or min_edge)
+    if (not learning_enabled) or learning_shadow:
+        effective_min_edge = float(min_edge)
+    strategy_multipliers = dict(policy.get("strategy_multipliers") or {})
+
+    # Filter actionable signals based on selected strategy set.
+    signals = [s for s in signals if s.get("strategy") in selected]
+    actionable = [s for s in signals if abs(s.get("edge", 0)) >= effective_min_edge]
+    # Enrich with OSINT (deterministic) before final ordering/selection. It is
+    # intentionally skipped for pure BTC 5m scalps because news is irrelevant on a
+    # 5-minute candle-betting horizon.
+    if not btc_only:
+        actionable = await apply_osint_google_news(actionable)
+    actionable, policy_rejected = apply_execution_filters(actionable, execution_policy)
     # Rank with composite score + market/direction diversification
+    for s in actionable:
+        strat = str(s.get("strategy") or "")
+        mult = float(strategy_multipliers.get(strat, 1.0) or 1.0)
+        s["_learn_score"] = float(s.get("net_edge", s.get("edge", 0)) or 0) * mult
+    actionable.sort(key=lambda x: float(x.get("_learn_score", x.get("net_edge", x.get("edge", 0))) or 0), reverse=True)
+
     top_signals = select_best_orders(actionable, max_per_scan)
     # Optional local LLM re-rank over already filtered picks
-    if LLM_PAPER_ENABLED and top_signals:
-        top_signals = await llm_select_signals(top_signals, max_per_scan)
+    if llm_enabled and top_signals:
+        top_signals = await llm_select_signals(top_signals, max_per_scan, mode=llm_mode, url=llm_url)
 
     executed: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
     for sig in top_signals:
         try:
-            direction = sig.get("direction", "yes").upper()
-            if direction not in ("YES", "NO"):
-                direction = "YES"
+            raw_direction = str(sig.get("direction", "yes") or "yes").lower()
+            if raw_direction not in {"yes", "no"}:
+                skipped.append({
+                    "market_slug": sig.get("event_slug", ""),
+                    "reason": f"unsupported signal direction for paper execution: {raw_direction}",
+                    "strategy": sig.get("strategy", ""),
+                })
+                continue
 
+            direction = raw_direction.upper()
             entry_price = sig.get("market_probability", 0.5)
             if direction == "NO":
                 entry_price = 1.0 - entry_price
@@ -424,24 +724,36 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
             skipped.append({"market_slug": sig.get("event_slug", ""), "reason": f"error: {e}"})
 
     status = wallet.get_status()
+    learning_info = learning_snapshot(ls)
+    wallet.save()
 
     return {
         "settlement": settlement_report,
-        "scan": {
+            "scan": {
 
             "total_markets": scan_result.get("total_markets", 0),
             "total_signals": scan_result.get("total_signals", 0),
             "actionable_signals": len(actionable),
             "by_strategy": scan_result.get("by_strategy", {}),
+            "strategy_mode": PAPER_STRATEGY_MODE,
+            "min_edge_base": min_edge,
+            "min_edge_effective": effective_min_edge,
+            "min_net_edge": execution_policy.get("min_net_edge"),
+            "policy_rejected_signals": len(policy_rejected),
         },
         "execution": {
             "attempted": len(top_signals),
             "executed": len(executed),
             "skipped": len(skipped),
+            "policy_rejected": len(policy_rejected),
             "trades": executed,
-            "skipped_reasons": skipped[:5],  # top 5 skip reasons
+            "skipped_reasons": (skipped + policy_rejected)[:5],  # top 5 skip reasons
+            "execution_policy": execution_policy,
+            "llm_enabled": llm_enabled,
+            "llm_mode": llm_mode,
         },
         "wallet": status,
+        "learning": learning_info,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -463,7 +775,11 @@ def format_report(report: Dict[str, Any]) -> str:
     # Scan
     sc = report.get("scan", {})
     lines.append("")
-    lines.append(f"🔍 **Scan:** {sc.get('total_markets', 0)} markets, {sc.get('total_signals', 0)} signals ({sc.get('actionable_signals', 0)} actionable)")
+    lines.append(f"🔍 **Scan:** {sc.get('total_markets', 0)} markets, {sc.get('total_signals', 0)} signals ({sc.get('actionable_signals', 0)} actionable) | mode={sc.get('strategy_mode', 'all')}")
+    if sc.get('min_edge_effective') is not None:
+        lines.append(f"  🧠 learning min_edge: base={float(sc.get('min_edge_base', 0)):.3f} → efetivo={float(sc.get('min_edge_effective', 0)):.3f}")
+    if sc.get('min_net_edge') is not None:
+        lines.append(f"  🧮 execution min_net_edge={float(sc.get('min_net_edge', 0)):.3f} | policy_rejected={int(sc.get('policy_rejected_signals', 0) or 0)}")
     by_strat = sc.get("by_strategy", {})
     if by_strat:
         lines.append("  " + " | ".join(f"{k}: {v}" for k, v in by_strat.items()))
@@ -471,7 +787,7 @@ def format_report(report: Dict[str, Any]) -> str:
     # Execution
     ex = report.get("execution", {})
     lines.append("")
-    lines.append(f"💰 **Trades:** {ex.get('executed', 0)} opened, {ex.get('skipped', 0)} skipped")
+    lines.append(f"💰 **Trades:** {ex.get('executed', 0)} opened, {ex.get('skipped', 0)} skipped, {ex.get('policy_rejected', 0)} policy-rejected")
     for t in ex.get("trades", [])[:5]:
 
         lines.append(f"  ✅ {t.get('strategy', '?')} {t.get('side', '?')} {t.get('event_title', '?')[:35]} @ {t.get('entry_price', 0):.2f} ${t.get('size', 0):.0f} edge={t.get('edge', 0):.1%}")
@@ -481,11 +797,16 @@ def format_report(report: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"💳 **Wallet:** ${w.get('bankroll', 0):,.0f} | Exposure: ${w.get('total_exposure', 0):,.0f} | Open: {w.get('open_positions', 0)} | History: {w.get('history_count', 0)}")
 
+    lrn = report.get("learning", {})
+    if lrn:
+        lines.append(f"🧠 **Learning:** enabled={lrn.get('enabled')} shadow={lrn.get('shadow_mode')} eff_min_edge={float(lrn.get('effective_min_edge', 0)):.3f} conf={lrn.get('confidence', '-')}")
+
     return "\n".join(lines)
 
 if __name__ == "__main__":
     async def _main():
         mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+        backup_wallet_file()
         wallet = Wallet()
 
         if mode == "settle":
@@ -501,6 +822,14 @@ if __name__ == "__main__":
         else:
             print(f"Usage: python settlement.py [settle|full]")
             return
+
+        base_dir = Path(__file__).resolve().parent
+        logs_dir = base_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / "last_report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
         print(format_report(report))
 
