@@ -108,7 +108,7 @@ start_python_service() {
       echo "$name ja estava rodando (PID $existing_pid)"
     else
       : > "$log_file"
-      nohup "$PYTHON_BIN" "$BASE_DIR/$script" > "$log_file" 2>&1 < /dev/null &
+      nohup "$PYTHON_BIN" "$BASE_DIR/$script" > "$log_file" 2>&1 < /dev/null 9>&- &
       echo $! > "$pid_file"
       echo "$name iniciado (PID $(cat "$pid_file"))"
     fi
@@ -142,7 +142,7 @@ start_paper_loop() {
   fi
 
   : > logs/paper_loop.out
-  nohup bash "$BASE_DIR/paper_loop.sh" > logs/paper_loop.out 2>&1 < /dev/null &
+  nohup bash "$BASE_DIR/paper_loop.sh" > logs/paper_loop.out 2>&1 < /dev/null 9>&- &
   echo $! > logs/paper_loop.pid
   echo "paper_loop iniciado (PID $(cat logs/paper_loop.pid))"
 

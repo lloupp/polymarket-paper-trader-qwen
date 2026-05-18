@@ -28,6 +28,7 @@ sleep 1
 pkill -f "$BASE_DIR/monitor_web.py" || true
 pkill -f "$BASE_DIR/paper_loop.sh" || true
 pkill -f "$BASE_DIR/llm_server_qwen.py" || true
+pkill -f "[p]ython.*settlement.py full" || true
 rm -f logs/paper_loop.lock logs/paper_loop.pid logs/monitor_web.pid logs/llm_server.pid || true
 
 echo "Servicos encerrados (se estavam ativos)."
