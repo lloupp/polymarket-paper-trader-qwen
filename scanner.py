@@ -807,28 +807,32 @@ async def detect_value_betting(markets: List[GammaMarket]) -> List[Signal]:
             confidence = 0.5
 
             # Pattern A: Near 50% with high volume
+            # Direction requires momentum — flat near-50% has no directional alpha.
             if divergence < 0.15 and m.volume_24hr > VALUE_MIN_VOLUME * 2:
                 if vol_liq_ratio > 1.5:
-                    direction = "yes" if m.yes_price > 0.5 else "no"
-                    model_prob = m.yes_price + (0.05 if m.yes_price > 0.5 else -0.05)
-                    edge = abs(model_prob - m.yes_price)
+                    direction = "yes" if m.price_change_1d > 0.02 else "no"
+                    # Scale edge by vol_liq_ratio strength (more volume over liq = more conviction).
+                    edge = round(min(0.10, 0.04 + (vol_liq_ratio - 1.5) * 0.008), 4)
+                    model_prob = m.yes_price + (edge if direction == "yes" else -edge)
                     signal_type = "high_volume_near_50"
                     confidence = 0.5 + min(vol_liq_ratio / 10, 0.3)
 
-            # Pattern B: Low liquidity + high volume
+            # Pattern B: Low liquidity + high volume (informed money signal)
+            # Direction requires momentum — without it, default NO as hedge.
             if m.liquidity < m.volume_24hr * 0.5 and m.volume_24hr > VALUE_MIN_VOLUME:
-                direction = "yes" if m.yes_price > m.no_price else "no"
+                direction = "yes" if m.price_change_1d > 0.02 else "no"
                 model_prob = m.yes_price + (0.08 if direction == "yes" else -0.08)
                 model_prob = max(0.01, min(0.99, model_prob))
                 edge = abs(model_prob - m.yes_price)
                 signal_type = "informed_money_low_liq"
                 confidence = 0.4 + min(vol_liq_ratio / 5, 0.35)
 
-            # Pattern C: Contrarian divergence
+            # Pattern C: Contrarian divergence — fade extreme prices. Direction is logically sound.
             if divergence >= VALUE_DIVERGENCE_THRESHOLD and m.volume_24hr > VALUE_MIN_VOLUME * 5:
                 direction = "no" if m.yes_price > 0.65 else "yes"
-                model_prob = m.yes_price + (-0.05 if m.yes_price > 0.65 else 0.05)
-                edge = abs(model_prob - m.yes_price)
+                # Scale edge by divergence magnitude (further from 50% = stronger fade).
+                edge = round(min(0.12, 0.04 + (divergence - 0.15) * 0.20), 4)
+                model_prob = m.yes_price + (-edge if m.yes_price > 0.65 else edge)
                 signal_type = "contrarian_divergence"
                 confidence = 0.4 + divergence
 
@@ -1096,7 +1100,13 @@ async def detect_event_countdown(markets: List[GammaMarket]) -> List[Signal]:
             if abs(m.yes_price - 0.5) < EVENT_COUNTDOWN_MID_BAND:
                 continue
 
-            direction = "yes" if m.yes_price > 0.5 else "no"
+            # Require momentum for YES — flat markets default to NO (same fix as smart_money).
+            if m.price_change_1d > 0.02:
+                direction = "yes"
+            elif m.price_change_1d < -0.01:
+                direction = "no"
+            else:
+                direction = "no"
             market_anchor = m.yes_price if direction == "yes" else m.no_price
 
             # Boost increases as end approaches.
@@ -1493,7 +1503,8 @@ async def detect_endgame_last_minute(events: Optional[List[Dict[str, Any]]] = No
             if directional_edge < ENDGAME_MIN_DIRECTIONAL_EDGE:
                 continue
 
-            direction = "yes" if m.yes_price > m.no_price else "no"
+            # Near-close markets with YES > 0.5 leave minimal upside — default NO unless recent momentum confirms.
+            direction = "yes" if m.price_change_1d > 0.02 else "no"
             entry_price = m.yes_price if direction == "yes" else m.no_price
             if entry_price <= 0 or entry_price >= ENDGAME_MAX_ENTRY_PRICE:
                 continue

@@ -23,8 +23,8 @@ from learning import append_trade_feature, build_trade_feature, ensure_learning_
 # Default settings
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "stop_loss": 0.10,
-    "take_profit": 0.25,
+    "stop_loss": 0.15,
+    "take_profit": 0.30,
     "max_trade": 50,
     "max_exposure": 500,
     "min_trade": 10,

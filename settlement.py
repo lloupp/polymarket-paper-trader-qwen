@@ -390,12 +390,18 @@ def select_best_orders(signals: List[Dict[str, Any]], max_pick: int) -> List[Dic
     return picks
 
 
+_NEGATIVE_OSINT_KEYWORDS = frozenset({
+    "injury", "injured", "suspended", "cancelled", "postponed",
+    "withdrawn", "scratched", "forfeit", "canceled", "retire",
+})
+
+
 def _extract_news_query(signal: Dict[str, Any]) -> str:
     title = (signal.get("event_title") or "").strip()
     slug = (signal.get("event_slug") or "").replace("-", " ").strip()
     raw = title or slug
     tokens = [t for t in re.findall(r"[A-Za-z0-9']+", raw) if len(t) > 2]
-    return " ".join(tokens[:8])
+    return " ".join(tokens[:10])
 
 async def _google_news_count(query: str, *, window_hours: int, max_articles: int) -> int:
     if not query:
@@ -443,10 +449,14 @@ async def apply_osint_google_news(signals: List[Dict[str, Any]]) -> List[Dict[st
             window_hours=OSINT_GOOGLE_NEWS_WINDOW_HOURS,
             max_articles=OSINT_GOOGLE_NEWS_MAX_ARTICLES,
         )
-        bonus = min(OSINT_GOOGLE_NEWS_BONUS_CAP, 0.005 * count)
+        raw_text = query.lower()
+        negative_hits = sum(1 for kw in _NEGATIVE_OSINT_KEYWORDS if kw in raw_text)
+        sentiment_penalty = min(0.02, 0.005 * negative_hits)
+        bonus = max(0.0, min(OSINT_GOOGLE_NEWS_BONUS_CAP, 0.005 * count - sentiment_penalty))
         enriched = dict(signal)
         enriched["osint_news_query"] = query
         enriched["osint_news_hits"] = count
+        enriched["osint_negative_hits"] = negative_hits
         enriched["osint_bonus"] = round(bonus, 4)
         enriched["osint_score"] = round(min(1.0, count / max(1, OSINT_GOOGLE_NEWS_MAX_ARTICLES)), 4)
         enriched["edge"] = float(enriched.get("edge", 0.0) or 0.0) + bonus
