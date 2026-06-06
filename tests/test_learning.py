@@ -48,7 +48,7 @@ class LearningPolicyTest(unittest.TestCase):
 
         self.assertEqual(smart["n"], 3)
         self.assertEqual(smart["wins"], 2)
-        self.assertAlmostEqual(smart["avg_pnl"], 4.0 / 3.0, places=6)
+        self.assertAlmostEqual(smart["avg_pnl_pct"], 4.0 / 3.0, places=6)
         self.assertAlmostEqual(smart["avg_hold_minutes"], 10.0)
         self.assertAlmostEqual(smart["stop_loss_rate"], 1.0 / 3.0, places=6)
 

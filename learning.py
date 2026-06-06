@@ -75,6 +75,8 @@ def build_trade_feature(closed_pos: Dict[str, Any], strategy_mode: str) -> Dict[
         hold_minutes = round((closed - opened).total_seconds() / 60.0, 3)
 
     pnl = float((closed_pos.get("realized_pnl") if closed_pos.get("realized_pnl") is not None else closed_pos.get("pnl", 0)) or 0)
+    size = float(closed_pos.get("size") or 0)
+    pnl_pct = round(pnl / size, 6) if size > 0 else 0.0
     edge = float(closed_pos.get("edge") or 0)
     return {
         "closed_at": closed_pos.get("closed_at") or _now_iso(),
@@ -82,11 +84,12 @@ def build_trade_feature(closed_pos: Dict[str, Any], strategy_mode: str) -> Dict[
         "side": (closed_pos.get("side") or "").upper(),
         "edge": edge,
         "edge_bucket": _edge_bucket(edge),
-        "size": float(closed_pos.get("size") or 0),
+        "size": size,
         "entry_price": float(closed_pos.get("entry_price") or 0),
         "close_price": float(closed_pos.get("close_price") or 0),
         "close_reason": (closed_pos.get("close_reason") or "unknown"),
         "pnl": pnl,
+        "pnl_pct": pnl_pct,
         "win": 1 if pnl > 0 else 0,
         "hold_minutes": hold_minutes,
         "strategy_mode": strategy_mode,
@@ -116,44 +119,64 @@ def compute_learning_metrics(ls: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "n": 0,
                 "wins": 0,
-                "pnl_sum": 0.0,
+                "pnl_pct_sum": 0.0,
                 "stop_loss": 0,
-                "avg_hold_minutes": 0.0,
                 "_hold_sum": 0.0,
                 "_hold_count": 0,
+                "_yes_n": 0,
+                "_yes_wins": 0,
+                "_no_n": 0,
+                "_no_wins": 0,
             },
         )
+        win = 1 if int(f.get("win") or 0) == 1 else 0
         sb["n"] += 1
-        sb["wins"] += 1 if int(f.get("win") or 0) == 1 else 0
-        sb["pnl_sum"] += float(f.get("pnl") or 0)
+        sb["wins"] += win
+        sb["pnl_pct_sum"] += float(f.get("pnl_pct") or f.get("pnl") or 0)
         if str(f.get("close_reason") or "") == "stop_loss":
             sb["stop_loss"] += 1
         if f.get("hold_minutes") is not None:
             sb["_hold_sum"] += float(f.get("hold_minutes") or 0.0)
             sb["_hold_count"] += 1
+        side = str(f.get("side") or "").upper()
+        if side == "YES":
+            sb["_yes_n"] += 1
+            sb["_yes_wins"] += win
+        elif side == "NO":
+            sb["_no_n"] += 1
+            sb["_no_wins"] += win
 
         b = str(f.get("edge_bucket") or "unknown")
-        eb = edge_stats.setdefault(b, {"n": 0, "wins": 0, "pnl_sum": 0.0})
+        eb = edge_stats.setdefault(b, {"n": 0, "wins": 0, "pnl_pct_sum": 0.0})
         eb["n"] += 1
         eb["wins"] += 1 if int(f.get("win") or 0) == 1 else 0
-        eb["pnl_sum"] += float(f.get("pnl") or 0)
+        eb["pnl_pct_sum"] += float(f.get("pnl_pct") or f.get("pnl") or 0)
 
     for s, d in strategy_stats.items():
         n = max(1, int(d["n"]))
         wins = int(d["wins"])
         # Laplace smoothing
         d["winrate"] = round((wins + 1) / (n + 2), 6)
-        d["avg_pnl"] = round(float(d["pnl_sum"]) / n, 6)
+        d["avg_pnl_pct"] = round(float(d.pop("pnl_pct_sum", 0.0)) / n, 6)
         d["stop_loss_rate"] = round(float(d["stop_loss"]) / n, 6)
         hold_count = int(d.pop("_hold_count", 0) or 0)
         hold_sum = float(d.pop("_hold_sum", 0.0) or 0.0)
         d["avg_hold_minutes"] = round(hold_sum / hold_count, 6) if hold_count else None
+        # YES / NO side winrates (Laplace smoothed, only when n >= 3)
+        yes_n = int(d.pop("_yes_n", 0))
+        yes_w = int(d.pop("_yes_wins", 0))
+        no_n = int(d.pop("_no_n", 0))
+        no_w = int(d.pop("_no_wins", 0))
+        d["yes_winrate"] = round((yes_w + 1) / (yes_n + 2), 6) if yes_n >= 3 else None
+        d["no_winrate"] = round((no_w + 1) / (no_n + 2), 6) if no_n >= 3 else None
+        d["yes_n"] = yes_n
+        d["no_n"] = no_n
 
     for b, d in edge_stats.items():
         n = max(1, int(d["n"]))
         wins = int(d["wins"])
         d["winrate"] = round((wins + 1) / (n + 2), 6)
-        d["avg_pnl"] = round(float(d["pnl_sum"]) / n, 6)
+        d["avg_pnl_pct"] = round(float(d.pop("pnl_pct_sum", 0.0)) / n, 6)
 
     ls["strategy_stats"] = strategy_stats
     ls["edge_buckets_stats"] = edge_stats
@@ -164,21 +187,23 @@ def compute_learning_metrics(ls: Dict[str, Any]) -> Dict[str, Any]:
 def build_policy_recommendations(ls: Dict[str, Any], wallet_settings: Dict[str, Any]) -> Dict[str, Any]:
     current_min_edge = float(wallet_settings.get("min_edge", 0.05) or 0.05)
     min_samples = int(ls.get("min_samples") or 20)
+    # Edge bucket decisions use half the strategy threshold — buckets fill slower than strategy totals.
+    edge_min_samples = max(3, min_samples // 2)
     aggressiveness = str(ls.get("aggressiveness") or "medium")
-    step = {"low": 0.003, "medium": 0.005, "high": 0.01}.get(aggressiveness, 0.005)
+    step = {"low": 0.005, "medium": 0.010, "high": 0.020}.get(aggressiveness, 0.010)
 
     reasons: List[str] = []
     conf = "low"
     eff = current_min_edge
 
     edge_stats = ls.get("edge_buckets_stats") or {}
-    low_b = edge_stats.get("0.05_0.08", {"n": 0, "winrate": 0.5, "avg_pnl": 0.0})
-    high_b = edge_stats.get("0.12_0.20", {"n": 0, "winrate": 0.5, "avg_pnl": 0.0})
+    low_b = edge_stats.get("0.05_0.08", {"n": 0, "winrate": 0.5, "avg_pnl_pct": 0.0})
+    high_b = edge_stats.get("0.12_0.20", {"n": 0, "winrate": 0.5, "avg_pnl_pct": 0.0})
 
-    if int(low_b.get("n", 0)) >= min_samples and float(low_b.get("avg_pnl", 0)) < 0:
+    if int(low_b.get("n", 0)) >= edge_min_samples and float(low_b.get("avg_pnl_pct", low_b.get("avg_pnl", 0))) < 0:
         eff = min(0.12, eff + step)
-        reasons.append("edge baixo com pnl medio negativo: elevando min_edge")
-    elif int(high_b.get("n", 0)) >= min_samples and float(high_b.get("winrate", 0.5)) > 0.55 and float(high_b.get("avg_pnl", 0)) > 0:
+        reasons.append(f"edge baixo (n={low_b['n']}) com avg_pnl_pct negativo: elevando min_edge")
+    elif int(high_b.get("n", 0)) >= edge_min_samples and float(high_b.get("winrate", 0.5)) > 0.55 and float(high_b.get("avg_pnl_pct", high_b.get("avg_pnl", 0))) > 0:
         eff = max(0.03, eff - (step / 2.0))
         reasons.append("edge alto consistente: reduzindo min_edge levemente")
 
@@ -191,13 +216,21 @@ def build_policy_recommendations(ls: Dict[str, Any], wallet_settings: Dict[str, 
             continue
         qualified += 1
         wr = float(st.get("winrate", 0.5))
-        avg_pnl = float(st.get("avg_pnl", 0.0))
-        if wr < 0.47 and avg_pnl < 0:
+        avg_pnl_pct = float(st.get("avg_pnl_pct", st.get("avg_pnl", 0.0)))
+        if wr < 0.47 and avg_pnl_pct < 0:
             mult[strat] = 0.85
-        elif wr > 0.56 and avg_pnl > 0:
+        elif wr > 0.56 and avg_pnl_pct > 0:
             mult[strat] = 1.10
         else:
             mult[strat] = 1.0
+
+        # Apply additional YES-side penalty when YES winrate is significantly below NO
+        yes_wr = st.get("yes_winrate")
+        no_wr = st.get("no_winrate")
+        yes_n = int(st.get("yes_n", 0))
+        if yes_wr is not None and no_wr is not None and yes_n >= edge_min_samples:
+            if float(yes_wr) < 0.40 and float(no_wr) > float(yes_wr) + 0.10:
+                reasons.append(f"{strat}: YES winrate {yes_wr:.2f} muito abaixo de NO {no_wr:.2f} — sinal para scanner")
 
     if qualified >= 3:
         conf = "high"
