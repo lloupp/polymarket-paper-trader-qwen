@@ -8,19 +8,22 @@ exposure limits, and risk-based stop-loss / take-profit exits.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
-from learning import ensure_learning_state, build_trade_feature, append_trade_feature
+
+from learning import append_trade_feature, build_trade_feature, ensure_learning_state
 
 # ---------------------------------------------------------------------------
 # Default settings
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "stop_loss": 0.20,
+    "stop_loss": 0.10,
     "take_profit": 0.25,
     "max_trade": 50,
     "max_exposure": 500,
@@ -41,9 +44,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "event_countdown_min_vol24h": 25000,
     "btc_max_entry_price": 0.82,
     "btc_min_liquidity": 1000,
-    "endgame_max_entry_price": 0.95,
+    "endgame_max_entry_price": 0.90,
     "endgame_min_liquidity": 1500,
-    "shadow_strategies": "arbitrage,value,mean_reversion,volume_spike",
+    "shadow_strategies": "arbitrage,value,mean_reversion,volume_spike,weather_forecast",
 }
 
 DEFAULT_STATE: Dict[str, Any] = {
@@ -91,11 +94,23 @@ class Wallet:
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
+    @contextmanager
+    def _file_lock(self, exclusive: bool):
+        lock_path = self.path + ".lock"
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(lock_path, "a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     def load(self) -> None:
         """Load wallet state from the JSON file. Create defaults if missing."""
         if os.path.exists(self.path):
-            with open(self.path, "r") as fh:
-                self.state = json.load(fh)
+            with self._file_lock(exclusive=False):
+                with open(self.path, "r") as fh:
+                    self.state = json.load(fh)
         else:
             self.state = self._deep_copy(DEFAULT_STATE)
             self.save()
@@ -108,12 +123,13 @@ class Wallet:
     def save(self) -> None:
         """Persist current wallet state to the JSON file (atomic-ish write)."""
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(self.state, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, self.path)
+        tmp = f"{self.path}.{os.getpid()}.tmp"
+        with self._file_lock(exclusive=True):
+            with open(tmp, "w") as fh:
+                json.dump(self.state, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
 
     def _apply_auto_risk_settings(self) -> bool:
         """Auto-scale risk settings from bankroll. Enable with PAPER_AUTO_RISK=1 (default)."""
@@ -132,10 +148,10 @@ class Wallet:
 
         settings = dict(self.state.get("settings", {}))
 
-        max_exposure = round(min(bankroll, max(10.0, bankroll * 0.60)), 2)
-        max_trade = round(min(max_exposure, max(2.0, bankroll * 0.08)), 2)
-        min_trade = round(min(max_trade, max(1.0, bankroll * 0.02)), 2)
-        max_per_scan = int(max(1, min(6, bankroll // 30 or 1)))
+        max_exposure = round(min(bankroll, max(10.0, bankroll * 0.25)), 2)
+        max_trade = round(min(max_exposure, max(2.0, bankroll * 0.02)), 2)
+        min_trade = round(min(max_trade, max(1.0, bankroll * 0.005)), 2)
+        max_per_scan = int(max(1, min(3, bankroll // 100 or 1)))
 
         new_values = {
             "max_exposure": max_exposure,
@@ -160,6 +176,9 @@ class Wallet:
     def get_status(self) -> Dict[str, Any]:
         """Return a summary dict of wallet state."""
         positions = self.state.get("positions", {})
+        history = self.state.get("history", [])
+        trusted_history = [pos for pos in history if pos.get("trusted_for_pnl", True)]
+        quarantined_history = [pos for pos in history if not pos.get("trusted_for_pnl", True)]
         total_exposure = self.get_total_exposure()
         available = self.get_available_bankroll()
         return {
@@ -168,7 +187,11 @@ class Wallet:
             "open_positions": len(positions),
             "total_exposure": total_exposure,
             "available_bankroll": available,
-            "history_count": len(self.state.get("history", [])),
+            "history_count": len(history),
+            "trusted_history_count": len(trusted_history),
+            "quarantined_history_count": len(quarantined_history),
+            "trusted_closed_pnl": round(self.get_closed_pnl(), 6),
+            "raw_closed_pnl": round(self.get_raw_closed_pnl(), 6),
             "cooldown_count": len(self.state.get("cooldowns", {})),
             "settings": self.state.get("settings", {}),
         }
@@ -257,6 +280,7 @@ class Wallet:
             "pnl": None,
             "pnl_pct": None,
             "edge": edge,
+            "trusted_for_pnl": True,
         }
         if extra:
             position.update(extra)
@@ -307,10 +331,11 @@ class Wallet:
         # Move to history
         self.state.setdefault("history", []).append(pos)
 
-        # Learning feature row from closed simulated trade
-        ls = ensure_learning_state(self.state)
-        feat = build_trade_feature(pos, strategy_mode=str(self.state.get("last_strategy_mode") or "unknown"))
-        append_trade_feature(ls, feat)
+        if pos.get("trusted_for_pnl", True):
+            # Learning must only consume trades priced with trusted execution data.
+            ls = ensure_learning_state(self.state)
+            feat = build_trade_feature(pos, strategy_mode=str(self.state.get("last_strategy_mode") or "unknown"))
+            append_trade_feature(ls, feat)
 
         del self.state["positions"][position_id]
 
@@ -476,11 +501,16 @@ sition history (most recent first)."""
         return hist[-limit:][::-1]
 
     def get_closed_pnl(self) -> float:
-        """Total realized P&L across all closed positions."""
+        """Total trusted realized P&L across all closed positions."""
         return sum(
             pos.get("pnl", 0.0)
             for pos in self.state.get("history", [])
+            if pos.get("trusted_for_pnl", True)
         )
+
+    def get_raw_closed_pnl(self) -> float:
+        """Total realized P&L across all closed positions, including quarantined trades."""
+        return sum(pos.get("pnl", 0.0) for pos in self.state.get("history", []))
 
     def get_learning_state(self) -> Dict[str, Any]:
         """Return learning state, guaranteeing defaults exist."""

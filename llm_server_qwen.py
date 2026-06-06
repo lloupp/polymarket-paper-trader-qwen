@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from llama_cpp import Llama
 
-HOST = os.getenv("LLM_HOST", "0.0.0.0")
+HOST = os.getenv("LLM_HOST", "127.0.0.1")
 PORT = int(os.getenv("LLM_PORT", "8080"))
 N_THREADS = int(os.getenv("LLM_THREADS", "8"))
 N_CTX = int(os.getenv("LLM_CTX", "2048"))
