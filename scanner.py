@@ -17,14 +17,15 @@ import asyncio
 import json
 import logging
 import os
-import math
-import socket
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+from common import install_polymarket_dns_fallback, yes_no_from_gamma_market as _yes_no_from_gamma_market
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -41,26 +42,7 @@ logger = logging.getLogger("polymarket-scanner")
 # ---------------------------------------------------------------------------
 GAMMA_API = os.getenv("POLYMARKET_GAMMA_API", "https://gamma-api.polymarket.com")
 
-# WSL/local DNS can intermittently fail resolving Polymarket Cloudflare hosts.
-# Keep URL hostnames intact (TLS SNI still works) but bypass resolver failures
-# with the current Cloudflare A records unless explicitly disabled.
-POLYMARKET_STATIC_DNS = os.getenv("PAPER_POLYMARKET_STATIC_DNS", "0") == "1"
-POLYMARKET_STATIC_IP = os.getenv("PAPER_POLYMARKET_STATIC_IP", "104.18.34.205")
-_POLYMARKET_DNS_HOSTS = {"gamma-api.polymarket.com", "data-api.polymarket.com", "clob.polymarket.com"}
-_ORIG_GETADDRINFO = socket.getaddrinfo
-
-def _install_polymarket_dns_fallback() -> None:
-    if not POLYMARKET_STATIC_DNS or getattr(socket.getaddrinfo, "_polymarket_fallback", False):
-        return
-    def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        decoded = host.decode() if isinstance(host, (bytes, bytearray)) else host
-        if decoded in _POLYMARKET_DNS_HOSTS:
-            host = POLYMARKET_STATIC_IP
-        return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
-    _patched_getaddrinfo._polymarket_fallback = True  # type: ignore[attr-defined]
-    socket.getaddrinfo = _patched_getaddrinfo
-
-_install_polymarket_dns_fallback()
+install_polymarket_dns_fallback()
 
 # Arbitrage
 ARB_MIN_PROFIT_PCT = 0.01   # 1% minimum arb profit
@@ -72,6 +54,8 @@ ADVANCED_MIN_EDGE = 0.05    # 5% minimum edge to be actionable
 ADVANCED_KELLY_FRACTION = 0.25  # quarter-Kelly
 INITIAL_BANKROLL = 10000.0
 ADVANCED_MAX_TRADE_SIZE = 50.0
+GAMMA_TIMEOUT_SECONDS = float(os.getenv("PAPER_GAMMA_TIMEOUT_SECONDS", "8"))
+GAMMA_RETRY_ATTEMPTS = int(os.getenv("PAPER_GAMMA_RETRY_ATTEMPTS", "2"))
 
 # BTC 5-minute momentum/scalping, inspired by @ndjjwobaq public profile.
 # It enters only the current/near-current BTC Up/Down 5m market, usually
@@ -83,8 +67,10 @@ BTC_5M_MAX_SECONDS_IN = int(os.getenv("PAPER_BTC_5M_MAX_SECONDS_IN", "305"))
 BTC_5M_MIN_DIRECTIONAL_EDGE = float(os.getenv("PAPER_BTC_5M_MIN_DIRECTIONAL_EDGE", "0.035"))
 BTC_5M_NORMAL_MAX_PRICE = float(os.getenv("PAPER_BTC_5M_NORMAL_MAX_PRICE", "0.72"))
 BTC_5M_LATE_CONFIRM_MIN_SECONDS = int(os.getenv("PAPER_BTC_5M_LATE_CONFIRM_MIN_SECONDS", "210"))
-BTC_5M_LATE_CONFIRM_MAX_PRICE = float(os.getenv("PAPER_BTC_5M_LATE_CONFIRM_MAX_PRICE", "0.99"))
+BTC_5M_LATE_CONFIRM_MAX_PRICE = float(os.getenv("PAPER_BTC_5M_LATE_CONFIRM_MAX_PRICE", "0.88"))
 BTC_5M_MIN_LIQUIDITY = float(os.getenv("PAPER_BTC_5M_MIN_LIQUIDITY", "1000"))
+BTC_5M_HIGH_PRICE_PENALTY_START = float(os.getenv("PAPER_BTC_5M_HIGH_PRICE_PENALTY_START", "0.78"))
+BTC_5M_HIGH_PRICE_MAX_PENALTY = float(os.getenv("PAPER_BTC_5M_HIGH_PRICE_MAX_PENALTY", "0.045"))
 
 # BTC 5m Endgame (last-minute dedicated)
 ENDGAME_ENABLED = os.getenv("PAPER_ENDGAME_ENABLED", "1") == "1"
@@ -92,8 +78,18 @@ ENDGAME_WINDOW_START_SECONDS = int(os.getenv("PAPER_ENDGAME_WINDOW_START_SECONDS
 ENDGAME_WINDOW_END_SECONDS = int(os.getenv("PAPER_ENDGAME_WINDOW_END_SECONDS", "299"))
 ENDGAME_MIN_DIRECTIONAL_EDGE = float(os.getenv("PAPER_ENDGAME_MIN_DIRECTIONAL_EDGE", "0.06"))
 ENDGAME_MIN_LIQUIDITY = float(os.getenv("PAPER_ENDGAME_MIN_LIQUIDITY", "1500"))
-ENDGAME_MAX_ENTRY_PRICE = float(os.getenv("PAPER_ENDGAME_MAX_ENTRY_PRICE", "0.95"))
+ENDGAME_MAX_ENTRY_PRICE = float(os.getenv("PAPER_ENDGAME_MAX_ENTRY_PRICE", "0.90"))
 ENDGAME_BASE_SIZE = float(os.getenv("PAPER_ENDGAME_BASE_SIZE", "35"))
+
+# Weather forecast strategy (shadow-first by default in execution policy)
+WEATHER_ENABLED = os.getenv("PAPER_WEATHER_ENABLED", "1") == "1"
+WEATHER_MIN_EDGE = float(os.getenv("PAPER_WEATHER_MIN_EDGE", "0.08"))
+WEATHER_MAX_SPREAD = float(os.getenv("PAPER_WEATHER_MAX_SPREAD", "0.08"))
+WEATHER_MIN_LIQUIDITY = float(os.getenv("PAPER_WEATHER_MIN_LIQUIDITY", "500"))
+WEATHER_MAX_DAYS_AHEAD = int(os.getenv("PAPER_WEATHER_MAX_DAYS_AHEAD", "16"))
+WEATHER_TIMEOUT_SECONDS = float(os.getenv("PAPER_WEATHER_TIMEOUT_SECONDS", "8"))
+WEATHER_GEOCODE_API = os.getenv("PAPER_WEATHER_GEOCODE_API", "https://geocoding-api.open-meteo.com/v1/search")
+WEATHER_FORECAST_API = os.getenv("PAPER_WEATHER_FORECAST_API", "https://api.open-meteo.com/v1/forecast")
 
 # Mean Reversion
 MEAN_REVERSION_THRESHOLD = 0.10   # 10% weekly move (primary)
@@ -312,6 +308,170 @@ def _direction_from_price_change(m: GammaMarket) -> str:
         return "no"
     return "yes" if m.yes_price < 0.5 else "no"
 
+def _high_entry_price_penalty(entry_price: float) -> float:
+    """Penalty for short-horizon BTC entries where remaining upside is small."""
+    if entry_price <= BTC_5M_HIGH_PRICE_PENALTY_START:
+        return 0.0
+    room = max(0.001, 1.0 - BTC_5M_HIGH_PRICE_PENALTY_START)
+    expensive = min(1.0, (entry_price - BTC_5M_HIGH_PRICE_PENALTY_START) / room)
+    return BTC_5M_HIGH_PRICE_MAX_PENALTY * expensive
+
+
+_MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+
+def _weather_text(m: GammaMarket) -> str:
+    return " ".join(x for x in [m.question, m.event_title, m.event_slug, m.group_item_title] if x)
+
+
+def _parse_weather_date(text: str, now: Optional[datetime] = None) -> Optional[str]:
+    now = now or datetime.now(timezone.utc)
+    iso_match = re.search(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b", text)
+    if iso_match:
+        year, month, day = map(int, iso_match.groups())
+        try:
+            return datetime(year, month, day, tzinfo=timezone.utc).date().isoformat()
+        except ValueError:
+            return None
+
+    month_names = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    patterns = [
+        rf"\b({month_names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*(20\d{{2}}))?\b",
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_names})\.?(?:\s+(20\d{{2}}))?\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        parts = m.groups()
+        if parts[0].isdigit():
+            day = int(parts[0])
+            month = _MONTHS[parts[1].lower().rstrip(".")]
+            year = int(parts[2]) if parts[2] else now.year
+        else:
+            month = _MONTHS[parts[0].lower().rstrip(".")]
+            day = int(parts[1])
+            year = int(parts[2]) if parts[2] else now.year
+        try:
+            dt = datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        if dt.date() < (now - timedelta(days=1)).date() and not parts[2]:
+            dt = datetime(year + 1, month, day, tzinfo=timezone.utc)
+        return dt.date().isoformat()
+    return None
+
+
+def _parse_weather_location(text: str) -> Optional[str]:
+    clean = text.replace("-", " ")
+    patterns = [
+        r"\bin\s+([A-Za-z][A-Za-z .'-]{2,60}?)\s+(?:on|by|before|after|during)\b",
+        r"\bfor\s+([A-Za-z][A-Za-z .'-]{2,60}?)\s+(?:on|by|before|after|during)\b",
+        r"\bat\s+([A-Za-z][A-Za-z .'-]{2,60}?)\s+(?:on|by|before|after|during)\b",
+        r"^([A-Za-z][A-Za-z .'-]{1,45}?)\s+(?:high|low|max|min|temperature|temp)\b",
+    ]
+    stop_words = {
+        "the", "a", "an", "will", "it", "rain", "snow", "temperature", "high",
+        "low", "above", "below", "over", "under", "degrees", "fahrenheit", "celsius",
+    }
+    for pattern in patterns:
+        m = re.search(pattern, clean, flags=re.IGNORECASE)
+        if not m:
+            continue
+        loc = re.sub(r"\s+", " ", m.group(1)).strip(" ?.,")
+        loc = re.sub(r"\b(?:high|low|temperature|rain|snow|weather)\b", "", loc, flags=re.IGNORECASE)
+        loc = re.sub(r"\s+", " ", loc).strip(" ?.,")
+        if len(loc) >= 3 and loc.lower() not in stop_words:
+            return loc
+    return None
+
+
+def _parse_weather_metric(text: str) -> Optional[Dict[str, Any]]:
+    lower = text.lower()
+    if any(k in lower for k in ["rain", "precipitation", "precipitate", "showers"]):
+        return {"metric": "rain"}
+
+    if not any(k in lower for k in ["temperature", "temp", "degrees", "°", "fahrenheit", "celsius"]):
+        return None
+
+    op_match = re.search(
+        r"\b(above|over|at least|exceed(?:s)?|greater than|below|under|less than|at most)\b[^0-9-]*(-?\d+(?:\.\d+)?)\s*(?:°?\s*([fc])|degrees?\s*(fahrenheit|celsius)?)?",
+        lower,
+    )
+    if not op_match:
+        return None
+    op_raw = op_match.group(1)
+    operator = "above" if op_raw in {"above", "over", "at least", "exceed", "exceeds", "greater than"} else "below"
+    threshold = float(op_match.group(2))
+    unit_raw = (op_match.group(3) or op_match.group(4) or "f").lower()
+    unit = "celsius" if unit_raw.startswith("c") else "fahrenheit"
+    temp_kind = "min" if re.search(r"\b(low|min|minimum)\b", lower) else "max"
+    return {
+        "metric": "temperature",
+        "operator": operator,
+        "threshold": threshold,
+        "unit": unit,
+        "temp_kind": temp_kind,
+    }
+
+
+def _is_weather_market(m: GammaMarket) -> bool:
+    text = _weather_text(m).lower()
+    weather_terms = [
+        "weather", "rain", "precipitation", "showers", "temperature", "degrees",
+        "fahrenheit", "celsius", "heat", "cold", "snow",
+    ]
+    return any(term in text for term in weather_terms)
+
+
+def _weather_probability_from_forecast(spec: Dict[str, Any], forecast: Dict[str, Any], date_iso: str) -> Optional[Tuple[float, float, str]]:
+    daily = forecast.get("daily") if isinstance(forecast, dict) else None
+    if not isinstance(daily, dict):
+        return None
+    dates = list(daily.get("time") or [])
+    if date_iso not in dates:
+        return None
+    i = dates.index(date_iso)
+
+    if spec["metric"] == "rain":
+        probs = daily.get("precipitation_probability_max") or []
+        sums = daily.get("precipitation_sum") or []
+        precip_prob = float(probs[i] or 0.0) / 100.0 if i < len(probs) and probs[i] is not None else 0.0
+        precip_sum = float(sums[i] or 0.0) if i < len(sums) and sums[i] is not None else 0.0
+        # Rain markets usually mean measurable rain. Combine probability and
+        # forecast amount without pretending to have station-level certainty.
+        amount_boost = min(0.25, precip_sum / 10.0)
+        yes_prob = max(0.03, min(0.97, precip_prob * 0.85 + amount_boost))
+        return yes_prob, precip_sum, f"rain_prob={precip_prob:.0%} precip_sum={precip_sum:.1f}mm"
+
+    key = "temperature_2m_min" if spec.get("temp_kind") == "min" else "temperature_2m_max"
+    temps = daily.get(key) or []
+    if i >= len(temps) or temps[i] is None:
+        return None
+    forecast_temp = float(temps[i])
+    threshold = float(spec["threshold"])
+    margin = 3.0 if spec.get("unit") == "fahrenheit" else 1.7
+    diff = forecast_temp - threshold
+    if spec.get("operator") == "below":
+        diff = -diff
+    if abs(diff) < margin:
+        return None
+    yes_prob = 0.5 + max(-0.42, min(0.42, diff / (margin * 4.0)))
+    return yes_prob, forecast_temp, f"{key}={forecast_temp:.1f} threshold={threshold:.1f} {spec.get('unit')}"
+
 # ---------------------------------------------------------------------------
 # Market fetcher
 # ---------------------------------------------------------------------------
@@ -322,16 +482,7 @@ def _parse_market(m: dict) -> Optional[GammaMarket]:
     if not mid:
         return None
 
-    # Outcome prices (double-encoded JSON string)
-    yes_price, no_price = 0.5, 0.5
-    prices = m.get("outcomePrices", "")
-    if prices:
-        try:
-            p = json.loads(prices) if isinstance(prices, str) else prices
-            if isinstance(p, list) and len(p) >= 2:
-                yes_price, no_price = float(p[0]), float(p[1])
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
+    yes_price, no_price = _yes_no_from_gamma_market(m)
 
     # Spread
     best_bid = float(m.get("bestBid", 0) or 0)
@@ -375,13 +526,13 @@ async def _fetch_paginated(
     pages: int,
     extra_params: Optional[dict] = None,
 ) -> list:
-    """Generic paginated fetch from Gamma API with 0.3s delay between pages."""
+    """Generic paginated fetch from Gamma API with bounded retries."""
     results: list = []
-    async with httpx.AsyncClient(timeout=15.0, trust_env=True) as client:
+    async with httpx.AsyncClient(timeout=GAMMA_TIMEOUT_SECONDS, trust_env=True) as client:
         for page in range(pages):
             params = {"limit": limit, "offset": page * limit, **(extra_params or {})}
             data = None
-            for attempt in range(3):
+            for attempt in range(GAMMA_RETRY_ATTEMPTS):
                 try:
                     resp = await client.get(url, params=params)
                     resp.raise_for_status()
@@ -394,7 +545,7 @@ async def _fetch_paginated(
                     except Exception:
                         body_preview = ""
 
-                    if attempt < 2:
+                    if attempt < GAMMA_RETRY_ATTEMPTS - 1:
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
                     if '503' in str(e) and ('Página bloqueada' in body_preview or '<html' in body_preview.lower()):
@@ -408,7 +559,7 @@ async def _fetch_paginated(
             if not data:
                 break
             results.extend(data)
-            await asyncio.sleep(0.3)  # 0.3s delay between pages
+            await asyncio.sleep(0.15)
     return results
 
 async def fetch_gamma_markets(limit: int = 200, pages: int = 4) -> List[GammaMarket]:
@@ -843,8 +994,7 @@ async def detect_smart_money(markets: List[GammaMarket]) -> List[Signal]:
             if vol_ratio < SMART_MONEY_VOLUME_RATIO:
                 continue
 
-            smart_score = (
-1 / max(m.spread, 0.001)) * vol_ratio
+            smart_score = (1 / max(m.spread, 0.001)) * vol_ratio
 
             # Direction from price change
             if m.price_change_1d > 0.01:
@@ -998,7 +1148,171 @@ async def detect_event_countdown(markets: List[GammaMarket]) -> List[Signal]:
 
 
 # ---------------------------------------------------------------------------
-# Strategy 7: BTC 5-minute momentum/scalping
+# Strategy 7: Weather forecast (shadow-first)
+# ---------------------------------------------------------------------------
+
+async def _weather_geocode(client: httpx.AsyncClient, location: str) -> Optional[Dict[str, Any]]:
+    try:
+        resp = await client.get(
+            WEATHER_GEOCODE_API,
+            params={"name": location, "count": 1, "language": "en", "format": "json"},
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results") or []
+        if not results:
+            return None
+        r = results[0]
+        if r.get("latitude") is None or r.get("longitude") is None:
+            return None
+        return {
+            "name": r.get("name") or location,
+            "admin1": r.get("admin1") or "",
+            "country": r.get("country") or "",
+            "latitude": float(r["latitude"]),
+            "longitude": float(r["longitude"]),
+        }
+    except Exception as e:
+        logger.debug("Weather geocode failed for %s: %s", location, e)
+        return None
+
+
+async def _weather_forecast(client: httpx.AsyncClient, geo: Dict[str, Any], unit: str) -> Optional[Dict[str, Any]]:
+    try:
+        resp = await client.get(
+            WEATHER_FORECAST_API,
+            params={
+                "latitude": geo["latitude"],
+                "longitude": geo["longitude"],
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum",
+                "temperature_unit": unit,
+                "timezone": "auto",
+                "forecast_days": WEATHER_MAX_DAYS_AHEAD,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.debug("Weather forecast failed for %s: %s", geo.get("name"), e)
+        return None
+
+
+async def detect_weather_forecast(
+    markets: List[GammaMarket],
+    now: Optional[datetime] = None,
+) -> List[Signal]:
+    """Detect weather-market edges from Open-Meteo forecasts.
+
+    This strategy is intended to run shadow-only initially. It only emits signals
+    for markets whose location/date/metric can be parsed conservatively.
+    """
+    signals: List[Signal] = []
+    if not WEATHER_ENABLED:
+        return signals
+
+    now = now or datetime.now(timezone.utc)
+    geocode_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    forecast_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+
+    async with httpx.AsyncClient(timeout=WEATHER_TIMEOUT_SECONDS, trust_env=False) as client:
+        for m in markets:
+            try:
+                if m.closed or not m.active:
+                    continue
+                if m.spread > WEATHER_MAX_SPREAD:
+                    continue
+                if m.liquidity < WEATHER_MIN_LIQUIDITY:
+                    continue
+                if m.yes_price < 0.03 or m.yes_price > 0.97:
+                    continue
+                if not _is_weather_market(m):
+                    continue
+
+                text = _weather_text(m)
+                spec = _parse_weather_metric(text)
+                if not spec:
+                    continue
+                date_iso = _parse_weather_date(text, now=now)
+                location = _parse_weather_location(text)
+                if not date_iso or not location:
+                    continue
+
+                target_dt = datetime.fromisoformat(date_iso).replace(tzinfo=timezone.utc)
+                days_ahead = (target_dt.date() - now.date()).days
+                if days_ahead < 0 or days_ahead >= WEATHER_MAX_DAYS_AHEAD:
+                    continue
+
+                geo = geocode_cache.get(location)
+                if location not in geocode_cache:
+                    geo = await _weather_geocode(client, location)
+                    geocode_cache[location] = geo
+                if not geo:
+                    continue
+
+                unit = str(spec.get("unit", "fahrenheit"))
+                cache_key = (location, unit)
+                forecast = forecast_cache.get(cache_key)
+                if cache_key not in forecast_cache:
+                    forecast = await _weather_forecast(client, geo, unit)
+                    forecast_cache[cache_key] = forecast
+                if not forecast:
+                    continue
+
+                probability = _weather_probability_from_forecast(spec, forecast, date_iso)
+                if not probability:
+                    continue
+                yes_prob, forecast_value, forecast_note = probability
+
+                yes_edge = yes_prob - m.yes_price
+                no_edge = (1.0 - yes_prob) - m.no_price
+                if yes_edge >= WEATHER_MIN_EDGE:
+                    direction = "yes"
+                    edge = yes_edge
+                    win_prob = yes_prob
+                elif no_edge >= WEATHER_MIN_EDGE:
+                    direction = "no"
+                    edge = no_edge
+                    win_prob = 1.0 - yes_prob
+                else:
+                    continue
+
+                entry_price = m.yes_price if direction == "yes" else m.no_price
+                kelly_frac, size = kelly_size(win_prob, entry_price, conservative=0.35, max_fraction=0.025)
+                confidence = min(0.82, 0.42 + edge * 2.2 + min(m.liquidity / 50000.0, 0.12))
+
+                location_label = ", ".join(x for x in [geo.get("name"), geo.get("admin1"), geo.get("country")] if x)
+                metric_label = spec["metric"]
+                signals.append(Signal(
+                    strategy="weather_forecast",
+                    market_id=m.market_id,
+                    event_slug=_slug_or_question(m),
+                    event_title=_title_or_question(m),
+                    direction=direction,
+                    model_probability=yes_prob,
+                    market_probability=m.yes_price,
+                    edge=edge,
+                    confidence=confidence,
+                    kelly_fraction=max(kelly_frac, 0.001),
+                    suggested_size=min(size, ADVANCED_MAX_TRADE_SIZE),
+                    spread=m.spread,
+                    liquidity=m.liquidity,
+                    volume_24hr=m.volume_24hr,
+                    reasoning=(
+                        f"WEATHER_FORECAST: {metric_label} {location_label} {date_iso} | "
+                        f"{forecast_note} modelYES:{yes_prob:.0%} mktYES:{m.yes_price:.0%} "
+                        f"dir:{direction.upper()} edge:{edge:.1%}"
+                    ),
+                    sources=["gamma_api_markets", "open_meteo", "weather_forecast"],
+                ))
+            except Exception as e:
+                logger.debug("Weather forecast detection failed for market %s: %s", m.market_id, e)
+
+    signals.sort(key=lambda s: s.confidence * abs(s.edge), reverse=True)
+    logger.info("Weather Forecast: %d signals found", len(signals))
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Strategy 8: BTC 5-minute momentum/scalping
 # ---------------------------------------------------------------------------
 
 def _btc_5m_start_ts_from_slug(slug: str) -> Optional[int]:
@@ -1016,24 +1330,25 @@ async def fetch_btc_5m_events(window_before: int = 1, window_after: int = 2) -> 
     now_ts = int(datetime.now(timezone.utc).timestamp())
     current_start = now_ts - (now_ts % 300)
     slugs = [f"btc-updown-5m-{current_start + i * 300}" for i in range(-window_before, window_after + 1)]
-    events: List[Dict[str, Any]] = []
-    async with httpx.AsyncClient(timeout=12.0, trust_env=True) as client:
-        for slug in slugs:
-            for attempt in range(3):
+    async with httpx.AsyncClient(timeout=GAMMA_TIMEOUT_SECONDS, trust_env=True) as client:
+        async def fetch_slug(slug: str) -> Optional[Dict[str, Any]]:
+            for attempt in range(GAMMA_RETRY_ATTEMPTS):
                 try:
                     resp = await client.get(f"{GAMMA_API}/events", params={"slug": slug})
                     resp.raise_for_status()
                     data = resp.json()
                     if isinstance(data, list) and data:
-                        events.append(data[0])
-                    break
+                        return data[0]
+                    return None
                 except Exception as e:
-                    if attempt < 2:
+                    if attempt < GAMMA_RETRY_ATTEMPTS - 1:
                         await asyncio.sleep(0.3 * (attempt + 1))
                         continue
                     logger.warning("BTC 5m fetch failed for %s after retries: %s", slug, e)
-            await asyncio.sleep(0.1)
-    return events
+            return None
+
+        results = await asyncio.gather(*(fetch_slug(slug) for slug in slugs))
+    return [event for event in results if event]
 
 async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) -> List[Signal]:
     """Detect BTC 5m Up/Down momentum signals.
@@ -1042,7 +1357,7 @@ async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) 
     - only BTC Up/Down 5-minute markets;
     - enter after the interval begins, not before;
     - follow the side whose Polymarket live probability has moved away from 50/50;
-    - prefer 0.30-0.72 entry prices, with optional late-confirmation up to 0.99;
+    - prefer <=0.72 entry prices, with conservative late-confirmation up to configured cap;
     - BUY-only paper entry and hold/settle via the existing deterministic settlement.
     """
     signals: List[Signal] = []
@@ -1090,11 +1405,16 @@ async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) 
             # Model probability is intentionally modest: odds are the signal, but
             # this is a very short-horizon binary trade with high variance.
             time_score = max(0.0, min(1.0, seconds_in / 300.0))
-            model_win_prob = min(0.95, entry_price + 0.06 + directional_edge * 0.55 + max(0.0, time_score - 0.55) * 0.08)
-            edge = max(0.0, model_win_prob - entry_price)
+            raw_edge = 0.06 + directional_edge * 0.55 + max(0.0, time_score - 0.55) * 0.08
+            edge = max(0.0, raw_edge - _high_entry_price_penalty(entry_price))
+            model_win_prob = min(0.95, entry_price + edge)
             confidence = min(0.88, 0.48 + directional_edge * 1.8 + min(m.volume_24hr / 5000.0, 0.12) + time_score * 0.08)
+            if entry_price > BTC_5M_HIGH_PRICE_PENALTY_START:
+                confidence *= 0.85
             # More aggressive than the old generic strategies but still capped by wallet max_trade.
             size_multiplier = 0.70 + min(directional_edge / 0.20, 1.0) * 0.60
+            if entry_price > BTC_5M_HIGH_PRICE_PENALTY_START:
+                size_multiplier *= 0.60
             suggested_size = min(ADVANCED_MAX_TRADE_SIZE, BTC_5M_BASE_SIZE * size_multiplier)
             kelly_frac = min(0.05, suggested_size / max(INITIAL_BANKROLL, 1.0))
             side_label = "UP" if direction == "yes" else "DOWN"
@@ -1179,13 +1499,17 @@ async def detect_endgame_last_minute(events: Optional[List[Dict[str, Any]]] = No
             time_left = max(1, 300 - seconds_in)
             urgency = 1.0 - (time_left / 60.0)  # 0..1 over final minute
             urgency = max(0.0, min(1.0, urgency))
-            model_win_prob = min(0.985, entry_price + 0.05 + directional_edge * 0.70 + urgency * 0.06)
-            edge = max(0.0, model_win_prob - entry_price)
+            raw_edge = 0.05 + directional_edge * 0.70 + urgency * 0.06
+            edge = max(0.0, raw_edge - _high_entry_price_penalty(entry_price))
+            model_win_prob = min(0.965, entry_price + edge)
             if edge < ADVANCED_MIN_EDGE:
                 continue
 
             confidence = min(0.93, 0.56 + directional_edge * 1.6 + urgency * 0.18)
             size_mult = 0.9 + min(directional_edge / 0.18, 1.0) * 0.5
+            if entry_price > BTC_5M_HIGH_PRICE_PENALTY_START:
+                confidence *= 0.85
+                size_mult *= 0.60
             suggested_size = min(ADVANCED_MAX_TRADE_SIZE, ENDGAME_BASE_SIZE * size_mult)
             kelly_frac = min(0.06, suggested_size / max(INITIAL_BANKROLL, 1.0))
 
@@ -1239,24 +1563,18 @@ async def scan_all() -> Dict[str, Any]:
     logger.info("=" * 50)
     logger.info("ADVANCED STRATEGY SCAN: Fetching markets...")
 
-    # Fetch data
-    try:
-        markets = await fetch_gamma_markets()
-    except Exception as e:
-        logger.error("Failed to fetch Gamma markets: %s", e)
-        markets = []
+    async def _fetch_or_empty(name: str, fetcher):
+        try:
+            return await fetcher()
+        except Exception as e:
+            logger.error("Failed to fetch %s: %s", name, e)
+            return []
 
-    try:
-        events = await fetch_gamma_events()
-    except Exception as e:
-        logger.error("Failed to fetch Gamma events: %s", e)
-        events = []
-
-    try:
-        btc_5m_events = await fetch_btc_5m_events()
-    except Exception as e:
-        logger.error("Failed to fetch BTC 5m events: %s", e)
-        btc_5m_events = []
+    markets, events, btc_5m_events = await asyncio.gather(
+        _fetch_or_empty("Gamma markets", fetch_gamma_markets),
+        _fetch_or_empty("Gamma events", fetch_gamma_events),
+        _fetch_or_empty("BTC 5m events", fetch_btc_5m_events),
+    )
 
     total_markets = len(markets)
     logger.info("Fetched %d markets, %d events", total_markets, len(events))
@@ -1272,6 +1590,7 @@ async def scan_all() -> Dict[str, Any]:
         ("Volume Spike", lambda: detect_volume_spikes(markets)),
         ("Smart Money", lambda: detect_smart_money(markets)),
         ("Event Countdown", lambda: detect_event_countdown(markets)),
+        ("Weather Forecast", lambda: detect_weather_forecast(markets)),
     ]
     for name, fn in strategy_funcs:
         try:

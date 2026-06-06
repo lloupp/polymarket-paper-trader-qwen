@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
+
+from common import KNOWN_STRATEGIES, RECOMMENDED_MODE, load_json, now_iso, save_json
 
 BASE = Path(__file__).resolve().parent
 LOGS = BASE / "logs"
@@ -20,30 +21,6 @@ LAST_REPORT = LOGS / "last_report.txt"
 LAST_REPORT_JSON = LOGS / "last_report.json"
 ACTIVE_STRATEGY_FILE = LOGS / "active_strategy.txt"
 LOOP_SECONDS_FILE = LOGS / "loop_seconds.txt"
-
-KNOWN_STRATEGIES = [
-    "btc_5m_momentum", "endgame_last_minute", "arbitrage", "value",
-    "mean_reversion", "volume_spike", "smart_money", "event_countdown"
-]
-RECOMMENDED_MODE = "btc_5m_momentum,endgame_last_minute,smart_money,event_countdown"
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def load_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def save_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
 
 
 def parse_report(report: str) -> dict[str, Any]:
@@ -82,7 +59,7 @@ def choose_mode_from_history(wallet: dict[str, Any]) -> str:
     w_win = float(settings.get("rot_weight_winrate", 0.7) or 0.7)
     w_pnl = float(settings.get("rot_weight_pnl", 0.3) or 0.3)
 
-    hist = wallet.get("history", [])[-window:]
+    hist = [h for h in wallet.get("history", []) if h.get("trusted_for_pnl", True)][-window:]
     by = defaultdict(lambda: {"wins": 0, "n": 0, "pnl": 0.0})
     for h in hist:
         s = str(h.get("strategy") or "").strip().lower()
@@ -107,33 +84,31 @@ def choose_mode_from_history(wallet: dict[str, Any]) -> str:
     selected = [s for _, s in scored[:top_k]]
     if "endgame_last_minute" not in selected:
         selected.append("endgame_last_minute")
+    if "weather_forecast" not in selected:
+        selected.append("weather_forecast")
     return ",".join(dict.fromkeys(selected))
 
 
 def dynamic_interval(wallet: dict[str, Any], report_metrics: dict[str, Any]) -> int:
-    base = 90
-    hist = wallet.get("history", [])[-20:]
-    pnls = [float(x.get("pnl", 0.0) or 0.0) for x in hist]
-    if len(pnls) >= 5:
-        mean = sum(pnls) / len(pnls)
-        var = sum((x - mean) ** 2 for x in pnls) / len(pnls)
-        vol = math.sqrt(var)
-        if vol >= 8:
-            return 70
-        if vol <= 2:
-            return 110
-    if report_metrics.get("actionable", 0) == 0:
-        return 120
-    return base
+    settings = wallet.get("settings", {}) if isinstance(wallet, dict) else {}
+    fixed = int(settings.get("loop_interval_seconds", 30) or 30)
+    return max(30, min(3600, fixed))
 
 
-def circuit_breaker(wallet: dict[str, Any], prev_state: dict[str, Any]) -> tuple[bool, str, int]:
+def _history_signature(hist: list[dict[str, Any]]) -> str:
+    if not hist:
+        return "0:"
+    return f"{len(hist)}:{hist[-1].get('id', '')}"
+
+
+def circuit_breaker(wallet: dict[str, Any], prev_state: dict[str, Any]) -> tuple[bool, str, int, str]:
     settings = wallet.get("settings", {}) if isinstance(wallet, dict) else {}
     loss_seq_threshold = int(settings.get("cb_loss_seq", 4) or 4)
     loss_sum_threshold = float(settings.get("cb_loss_sum6", -25.0) or -25.0)
     cooldown_default = int(settings.get("cb_cooldown_cycles", 2) or 2)
 
-    hist = wallet.get("history", [])
+    hist = [h for h in wallet.get("history", []) if h.get("trusted_for_pnl", True)]
+    signature = _history_signature(hist)
     last = hist[-6:]
     pnls = [float(x.get("pnl", 0.0) or 0.0) for x in last]
     losses_seq = 0
@@ -145,16 +120,18 @@ def circuit_breaker(wallet: dict[str, Any], prev_state: dict[str, Any]) -> tuple
     recent_sum = sum(pnls)
     cool = int(prev_state.get("cooldown_cycles", 0) or 0)
     if cool > 0:
-        return True, "cooldown_ativo", cool - 1
+        return True, "cooldown_ativo", cool - 1, str(prev_state.get("cb_last_signature") or signature)
     if losses_seq >= loss_seq_threshold or recent_sum <= loss_sum_threshold:
-        return True, f"circuit_breaker(losses_seq={losses_seq},sum6={recent_sum:.2f})", cooldown_default
-    return False, "ok", 0
+        if str(prev_state.get("cb_last_signature") or "") == signature:
+            return False, "ok", 0, signature
+        return True, f"circuit_breaker(losses_seq={losses_seq},sum6={recent_sum:.2f})", cooldown_default, signature
+    return False, "ok", 0, signature
 
 
 def build_timeline_entry(wallet: dict[str, Any], metrics: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     bankroll = float(wallet.get("bankroll", 0.0) or 0.0)
     initial = float(wallet.get("initial_bankroll", 0.0) or 0.0)
-    hist = wallet.get("history", [])
+    hist = [h for h in wallet.get("history", []) if h.get("trusted_for_pnl", True)]
     last10 = hist[-10:]
     wins = sum(1 for h in last10 if float(h.get("pnl", 0.0) or 0.0) > 0)
     closed_pnl_10 = sum(float(h.get("pnl", 0.0) or 0.0) for h in last10)
@@ -375,6 +352,14 @@ def health_ok(url: str) -> bool:
         return False
 
 
+def llm_health_expected(wallet: dict[str, Any]) -> bool:
+    settings = wallet.get("settings", {}) if isinstance(wallet, dict) else {}
+    enabled = settings.get("llm_enabled")
+    if enabled is None:
+        return False
+    return bool(enabled)
+
+
 def cmd_precycle() -> int:
     LOGS.mkdir(parents=True, exist_ok=True)
     wallet = load_json(WALLET_FILE, {})
@@ -383,10 +368,10 @@ def cmd_precycle() -> int:
 
     mode = choose_mode_from_history(wallet)
     interval = dynamic_interval(wallet, metrics)
-    paused, reason, next_cool = circuit_breaker(wallet, state)
+    paused, reason, next_cool, cb_signature = circuit_breaker(wallet, state)
 
     alerts = []
-    llm_ok = health_ok("http://127.0.0.1:8080/health")
+    llm_ok = True if not llm_health_expected(wallet) else health_ok("http://127.0.0.1:8080/health")
     dash_ok = health_ok("http://127.0.0.1:8090/health")
     fail_streak = int(state.get("health_fail_streak", 0) or 0)
     if llm_ok and dash_ok:
@@ -406,6 +391,7 @@ def cmd_precycle() -> int:
         "entries_paused": paused,
         "pause_reason": reason,
         "cooldown_cycles": next_cool,
+        "cb_last_signature": cb_signature if paused and reason.startswith("circuit_breaker") else state.get("cb_last_signature", cb_signature),
         "health_fail_streak": fail_streak,
         "alerts": alerts,
     }

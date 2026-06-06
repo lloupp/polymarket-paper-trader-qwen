@@ -1,20 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List  # noqa: UP035
 
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _to_dt(raw: Any) -> datetime | None:
-    if not raw or not isinstance(raw, str):
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except Exception:
-        return None
+from common import now_iso as _now_iso  # noqa: F401
+from common import to_dt as _to_dt
 
 
 def default_learning_state() -> Dict[str, Any]:

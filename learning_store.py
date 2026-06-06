@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from common import now_iso, to_dt as parse_dt
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_EVENT_LOG = BASE_DIR / "logs" / "learning_events.jsonl"
@@ -19,25 +20,9 @@ DEFAULT_PENDING_MAX = int(os.getenv("PAPER_LEARNING_PENDING_MAX", "5000"))
 DEFAULT_PENDING_MAX_AGE_HOURS = float(os.getenv("PAPER_LEARNING_PENDING_MAX_AGE_HOURS", "72"))
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def new_cycle_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
-
-
-def parse_dt(raw: Any) -> Optional[datetime]:
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:

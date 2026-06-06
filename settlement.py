@@ -10,48 +10,37 @@ import logging
 import os
 import re
 import shutil
-import socket
 import sys
-from pathlib import Path
-
 import xml.etree.ElementTree as ET
-from urllib.parse import quote_plus
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import httpx
 
-from wallet import Wallet
-from learning import ensure_learning_state, maybe_refresh_policy, learning_snapshot
+from common import (
+    KNOWN_STRATEGIES,
+    RECOMMENDED_MODE as RECOMMENDED_STRATEGY_MODE,
+    install_polymarket_dns_fallback,
+    yes_no_from_gamma_market,
+)
+from learning import ensure_learning_state, learning_snapshot, maybe_refresh_policy
 from learning_store import (
     new_cycle_id,
     observe_signal_outcomes_from_signals,
     record_signal_decisions,
     summarize_learning_events,
 )
+from wallet import Wallet
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("polymarket-settlement")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
 
-POLYMARKET_STATIC_DNS = os.getenv("PAPER_POLYMARKET_STATIC_DNS", "0") == "1"
-POLYMARKET_STATIC_IP = os.getenv("PAPER_POLYMARKET_STATIC_IP", "104.18.34.205")
-_POLYMARKET_DNS_HOSTS = {"gamma-api.polymarket.com", "data-api.polymarket.com", "clob.polymarket.com"}
-_ORIG_GETADDRINFO = socket.getaddrinfo
-
-def _install_polymarket_dns_fallback() -> None:
-    if not POLYMARKET_STATIC_DNS or getattr(socket.getaddrinfo, "_polymarket_fallback", False):
-        return
-    def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        decoded = host.decode() if isinstance(host, (bytes, bytearray)) else host
-        if decoded in _POLYMARKET_DNS_HOSTS:
-            host = POLYMARKET_STATIC_IP
-        return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
-    _patched_getaddrinfo._polymarket_fallback = True  # type: ignore[attr-defined]
-    socket.getaddrinfo = _patched_getaddrinfo
-
-_install_polymarket_dns_fallback()
+install_polymarket_dns_fallback()
 
 LLM_PAPER_ENABLED = os.getenv("PAPER_LLM_ENABLED", "0") == "1"
 LLM_PAPER_URL = os.getenv("PAPER_LLM_URL", "http://127.0.0.1:8080/v1/chat/completions")
@@ -66,7 +55,6 @@ WALLET_BACKUP_ENABLED = os.getenv("PAPER_WALLET_BACKUP_ENABLED", "1") == "1"
 WALLET_BACKUP_RETENTION = int(os.getenv("PAPER_WALLET_BACKUP_RETENTION", "48"))
 
 # Accepts: 'all', single strategy, or comma-separated strategies.
-RECOMMENDED_STRATEGY_MODE = "btc_5m_momentum,endgame_last_minute,smart_money,event_countdown"
 PAPER_STRATEGY_MODE = os.getenv("PAPER_STRATEGY_MODE", RECOMMENDED_STRATEGY_MODE).strip().lower()
 PAPER_MIN_NET_EDGE = float(os.getenv("PAPER_MIN_NET_EDGE", "0.035"))
 PAPER_TAKER_FEE_ESTIMATE = float(os.getenv("PAPER_TAKER_FEE_ESTIMATE", "0.001"))
@@ -79,19 +67,11 @@ PAPER_EVENT_COUNTDOWN_MIN_LIQUIDITY = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN
 PAPER_EVENT_COUNTDOWN_MIN_VOL24H = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN_VOL24H_EXEC", "25000"))
 PAPER_BTC_MAX_ENTRY_PRICE_EXEC = float(os.getenv("PAPER_BTC_MAX_ENTRY_PRICE_EXEC", "0.82"))
 PAPER_BTC_MIN_LIQUIDITY_EXEC = float(os.getenv("PAPER_BTC_MIN_LIQUIDITY_EXEC", "1000"))
-PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC = float(os.getenv("PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC", "0.95"))
+PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC = float(os.getenv("PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC", "0.90"))
 PAPER_ENDGAME_MIN_LIQUIDITY_EXEC = float(os.getenv("PAPER_ENDGAME_MIN_LIQUIDITY_EXEC", "1500"))
-PAPER_SHADOW_STRATEGIES = os.getenv("PAPER_SHADOW_STRATEGIES", "arbitrage,value,mean_reversion,volume_spike")
-KNOWN_STRATEGIES = {
-    "btc_5m_momentum",
-    "endgame_last_minute",
-    "arbitrage",
-    "value",
-    "mean_reversion",
-    "volume_spike",
-    "smart_money",
-    "event_countdown",
-}
+PAPER_SHADOW_STRATEGIES = os.getenv("PAPER_SHADOW_STRATEGIES", "arbitrage,value,mean_reversion,volume_spike,weather_forecast")
+GAMMA_TIMEOUT_SECONDS = float(os.getenv("PAPER_GAMMA_TIMEOUT_SECONDS", "8"))
+GAMMA_RETRY_ATTEMPTS = int(os.getenv("PAPER_GAMMA_RETRY_ATTEMPTS", "2"))
 BTC_ALIASES = {"btc_5m", "btc_5m_momentum", "ndjjwobaq"}
 
 DEFAULT_EXECUTION_POLICY = {
@@ -139,6 +119,71 @@ def execution_policy_from_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 policy[key] = default
     return policy
+
+def _json_list(value: Any) -> List[Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return value if isinstance(value, list) else []
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= price <= 1:
+        return price
+    return None
+
+
+def _side_index(side: str) -> int:
+    return 0 if str(side).upper() == "YES" else 1
+
+
+def resolved_side_prices_from_gamma(data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    prices = [_float_or_none(v) for v in _json_list(data.get("outcomePrices", ""))]
+    if len(prices) < 2 or prices[0] is None or prices[1] is None:
+        return None
+    yes_price = float(prices[0])
+    no_price = float(prices[1])
+    # Resolution payout should be a near-binary outcome. Avoid using stale
+    # probability snapshots as a deterministic settlement price.
+    if yes_price in {0.0, 1.0} and no_price in {0.0, 1.0}:
+        return yes_price, no_price
+    return None
+
+
+def _best_book_price(levels: Any, *, best: str) -> Optional[float]:
+    if not isinstance(levels, list):
+        return None
+    prices = [_float_or_none(item.get("price") if isinstance(item, dict) else None) for item in levels]
+    prices = [p for p in prices if p is not None and 0 < p < 1]
+    if not prices:
+        return None
+    return min(prices) if best == "ask" else max(prices)
+
+
+async def fetch_clob_book_quote(client: httpx.AsyncClient, token_id: str) -> Dict[str, Optional[float]]:
+    for attempt in range(GAMMA_RETRY_ATTEMPTS):
+        try:
+            resp = await client.get(f"{CLOB_API}/book", params={"token_id": token_id})
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "buy_price": _best_book_price(data.get("asks"), best="ask"),
+                "sell_price": _best_book_price(data.get("bids"), best="bid"),
+                "book_hash": data.get("hash"),
+                "book_timestamp": data.get("timestamp"),
+            }
+        except Exception:
+            if attempt == GAMMA_RETRY_ATTEMPTS - 1:
+                return {"buy_price": None, "sell_price": None, "book_hash": None, "book_timestamp": None}
+            await asyncio.sleep(0.3 * (attempt + 1))
+    return {"buy_price": None, "sell_price": None, "book_hash": None, "book_timestamp": None}
 
 
 async def llm_select_signals(
@@ -412,49 +457,89 @@ async def apply_osint_google_news(signals: List[Dict[str, Any]]) -> List[Dict[st
     return list(enriched_signals)
 
 async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Fetch current prices for a list of market IDs from Gamma API.
-    Returns {market_id: {"yes_price": float, "no_price": float, "closed": bool, "resolved": bool}}
+    """Fetch executable side prices for market IDs.
+
+    Open markets use CLOB executable quotes:
+    - BUY is the best ask, used for new paper entries.
+    - SELL is the best bid, used for risk exits.
+
+    Closed markets use binary Gamma outcome prices only when they look resolved.
     """
     results: Dict[str, Dict[str, Any]] = {}
-    async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=GAMMA_TIMEOUT_SECONDS, trust_env=False) as client:
         for mid in market_ids:
             try:
-                for attempt in range(3):
+                for attempt in range(GAMMA_RETRY_ATTEMPTS):
                     try:
                         resp = await client.get(f"{GAMMA_API}/markets/{mid}")
                         resp.raise_for_status()
                         break
                     except Exception:
-                        if attempt == 2:
+                        if attempt == GAMMA_RETRY_ATTEMPTS - 1:
                             raise
                         await asyncio.sleep(0.4 * (attempt + 1))
                 data = resp.json()
 
-                yes_price, no_price = 0.5, 0.5
-                prices = data.get("outcomePrices", "")
-                if prices:
-                    try:
-                        p = json.loads(prices) if isinstance(prices, str) else prices
-                        if isinstance(p, list) and len(p) >= 2:
-                            yes_price, no_price = float(p[0]), float(p[1])
-                    except (json.JSONDecodeError, ValueError, TypeError):
-                        pass
-
                 closed = bool(data.get("closed", False))
                 resolved = closed  # In Polymarket, closed = resolved for our purposes
+                tokens = [str(x) for x in _json_list(data.get("clobTokenIds", ""))]
+                outcomes = [str(x) for x in _json_list(data.get("outcomes", ""))]
+
+                if len(tokens) < 2:
+                    raise ValueError("market has no two clobTokenIds")
+
+                resolved_prices = resolved_side_prices_from_gamma(data) if closed else None
+                if resolved_prices:
+                    yes_price, no_price = resolved_prices
+                    yes_buy_price = yes_sell_price = yes_price
+                    no_buy_price = no_sell_price = no_price
+                    price_source = "gamma_resolution"
+                else:
+                    yes_quote, no_quote = await asyncio.gather(
+                        fetch_clob_book_quote(client, tokens[0]),
+                        fetch_clob_book_quote(client, tokens[1]),
+                    )
+                    yes_buy_price = yes_quote.get("buy_price")
+                    yes_sell_price = yes_quote.get("sell_price")
+                    no_buy_price = no_quote.get("buy_price")
+                    no_sell_price = no_quote.get("sell_price")
+                    yes_price = yes_sell_price
+                    no_price = no_sell_price
+                    price_source = "clob_book"
+                    if yes_sell_price is None or no_sell_price is None:
+                        raise ValueError("missing CLOB SELL quote for one or more outcomes")
 
                 results[mid] = {
+                    "ok": True,
                     "yes_price": yes_price,
                     "no_price": no_price,
-
+                    "yes_buy_price": yes_buy_price,
+                    "no_buy_price": no_buy_price,
+                    "yes_sell_price": yes_sell_price,
+                    "no_sell_price": no_sell_price,
+                    "yes_token_id": tokens[0],
+                    "no_token_id": tokens[1],
+                    "yes_outcome": outcomes[0] if len(outcomes) > 0 else "YES",
+                    "no_outcome": outcomes[1] if len(outcomes) > 1 else "NO",
+                    "yes_book_hash": yes_quote.get("book_hash") if not resolved_prices else None,
+                    "no_book_hash": no_quote.get("book_hash") if not resolved_prices else None,
+                    "yes_book_timestamp": yes_quote.get("book_timestamp") if not resolved_prices else None,
+                    "no_book_timestamp": no_quote.get("book_timestamp") if not resolved_prices else None,
+                    "price_source": price_source,
                     "closed": closed,
                     "resolved": resolved,
                     "question": data.get("question", ""),
                 }
-                await asyncio.sleep(0.2)  # rate limit
+                await asyncio.sleep(0.1)
             except Exception as e:
                 logger.warning("Failed to fetch price for market %s: %s", mid, e)
-                results[mid] = {"yes_price": 0.5, "no_price": 0.5, "closed": False, "resolved": False, "question": ""}
+                results[mid] = {
+                    "ok": False,
+                    "error": str(e),
+                    "closed": False,
+                    "resolved": False,
+                    "question": "",
+                }
     return results
 
 
@@ -483,11 +568,17 @@ def backup_wallet_file() -> Optional[Path]:
     return target
 
 def get_current_price(position: Dict[str, Any], market_data: Dict[str, Any]) -> float:
-    """Get the current price relevant to a position's side."""
+    """Get the executable exit price relevant to a position's side."""
     if position["side"] == "YES":
-        return market_data["yes_price"]
-    else:
-        return market_data["no_price"]
+        return market_data["yes_sell_price"]
+    return market_data["no_sell_price"]
+
+
+def get_entry_quote(side: str, market_data: Dict[str, Any]) -> Optional[float]:
+    """Get the executable entry price for buying the selected outcome token."""
+    if side == "YES":
+        return market_data.get("yes_buy_price")
+    return market_data.get("no_buy_price")
 
 async def settle_positions(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
     """Check all open positions and close any that hit stop-loss, take-profit,
@@ -535,14 +626,20 @@ async def settle_positions(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
         if not mdata:
             logger.warning("No price data for position %s (market=%s), skipping", pid[:8], lookup_key)
             continue
+        if not mdata.get("ok", False):
+            logger.warning("Unreliable price data for position %s (market=%s), skipping risk check", pid[:8], lookup_key)
+            continue
 
         checked += 1
         current_price = get_current_price(pos, mdata)
+        pos["current_exit_price_source"] = mdata.get("price_source")
+        pos["exit_execution_model"] = "conservative_buy_ask_sell_bid"
 
         # Check 1: Market resolved/closed
         if mdata.get("resolved"):
             logger.info("Market resolved for position %s — closing at %.2f", pid[:8], current_price)
             try:
+                pos["close_price_source"] = mdata.get("price_source")
                 closed = wallet.close_position(pid, current_price, reason="market_resolved")
                 closings.append({"position_id": pid, "reason": "market_resolved", "pnl": closed["pnl"]})
             except Exception as e:
@@ -551,6 +648,7 @@ async def settle_positions(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
 
         # Check 2: Stop-loss / take-profit
         try:
+            pos["close_price_source"] = mdata.get("price_source")
             result = wallet.check_risk_exit(pid, current_price)
             if result:
                 logger.info("Risk exit triggered for %s: %s (P&L=%.2f)", pid[:8], result["close_reason"], result["pnl"])
@@ -574,131 +672,36 @@ async def settle_positions(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
-    """Full cycle: scan strategies → execute trades → settle positions.
-    Returns a comprehensive report dict.
-    """
-    if wallet is None:
-        wallet = Wallet()
-    cycle_id = new_cycle_id()
-
-    # Import scanner
-    base_dir = Path(__file__).resolve().parent
-    sys.path.insert(0, str(base_dir))
-    from scanner import scan_all, scan_btc_5m_only
-
-    # Phase 1: Settle existing positions first
-    settlement_report = await settle_positions(wallet)
-
-    selected = _selected_strategies(PAPER_STRATEGY_MODE)
-    btc_only = selected == {'btc_5m_momentum'}
-
-    # Phase 2: Scan for new signals
-    if btc_only:
-        scan_result = await scan_btc_5m_only()
-    else:
-        scan_result = await scan_all()
-
-    # Phase 3: Execute top signals
-    all_signals = list(scan_result.get("signals", []) or [])
-    try:
-        outcome_summary = observe_signal_outcomes_from_signals(all_signals)
-    except Exception as e:
-        logger.warning("Learning signal outcome update failed: %s", e)
-        outcome_summary = {"enabled": True, "error": str(e), "outcome_events": 0, "pending": 0}
-
-    signals = list(all_signals)
-    if PAPER_DISABLE_NEW_ENTRIES:
-        top_signals = []
-        actionable = []
-        executed = []
-        skipped = [{"market_slug": "*", "reason": "entries paused by circuit breaker"}]
-        status = wallet.get_status()
-        learning_info = learning_snapshot(ensure_learning_state(wallet.state))
-        try:
-            decision_summary = record_signal_decisions(
-                cycle_id=cycle_id,
-                signals=all_signals,
-                selected_strategies=selected,
-                effective_min_edge=float(wallet.state.get("settings", {}).get("min_edge", 0.05) or 0.05),
-                accepted_signals=[],
-                policy_rejected=[],
-                top_signals=[],
-                executed=[],
-                skipped=skipped,
-                entries_paused=True,
-            )
-            store_summary = summarize_learning_events()
-            store_summary.update({"last_cycle_decisions": decision_summary, "last_cycle_outcomes": outcome_summary})
-        except Exception as e:
-            logger.warning("Learning signal decision recording failed: %s", e)
-            store_summary = {"error": str(e)}
-        wallet.save()
-        return {
-            "settlement": settlement_report,
-            "scan": {
-                "total_markets": scan_result.get("total_markets", 0),
-                "total_signals": scan_result.get("total_signals", 0),
-                "actionable_signals": 0,
-                "by_strategy": scan_result.get("by_strategy", {}),
-                "strategy_mode": PAPER_STRATEGY_MODE,
-                "min_edge_base": wallet.state.get("settings", {}).get("min_edge", 0.05),
-                "min_edge_effective": wallet.state.get("settings", {}).get("min_edge", 0.05),
-            },
-            "execution": {
-                "attempted": 0,
-                "executed": 0,
-                "skipped": 1,
-                "trades": [],
-                "skipped_reasons": skipped,
-            },
-            "wallet": status,
-            "learning": learning_info,
-            "learning_store": store_summary,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-    max_per_scan = wallet.state.get("settings", {}).get("max_per_scan", 10)
-    min_edge = wallet.state.get("settings", {}).get("min_edge", 0.05)
-    min_trade = wallet.state.get("settings", {}).get("min_trade", 10)
-    max_trade = wallet.state.get("settings", {}).get("max_trade", 50)
-    execution_policy = execution_policy_from_settings(wallet.state.get("settings", {}))
-    settings = wallet.state.get("settings", {})
-    llm_enabled = bool(settings.get("llm_enabled", LLM_PAPER_ENABLED))
-    llm_mode = str(settings.get("llm_mode", LLM_PAPER_MODE) or LLM_PAPER_MODE)
-    llm_url = str(settings.get("llm_url", LLM_PAPER_URL) or LLM_PAPER_URL)
-
-    # Learning policy (auto-adjust filters and ranking)
-    wallet.state["last_strategy_mode"] = PAPER_STRATEGY_MODE
-    ls = ensure_learning_state(wallet.state)
-    policy = maybe_refresh_policy(ls, wallet.state.get("settings", {}))
-    learning_enabled = bool(ls.get("enabled", True))
-    learning_shadow = bool(ls.get("shadow_mode", False))
-    effective_min_edge = float(policy.get("effective_min_edge", min_edge) or min_edge)
-    if (not learning_enabled) or learning_shadow:
-        effective_min_edge = float(min_edge)
-    strategy_multipliers = dict(policy.get("strategy_multipliers") or {})
-
-    # Filter actionable signals based on selected strategy set.
-    signals = [s for s in signals if s.get("strategy") in selected]
+async def _filter_and_rank_signals(
+    all_signals: List[Dict[str, Any]],
+    selected: set,
+    btc_only: bool,
+    effective_min_edge: float,
+    strategy_multipliers: Dict[str, float],
+    execution_policy: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Filter signals by strategy/edge, enrich with OSINT, apply policy filters, rank."""
+    signals = [s for s in all_signals if s.get("strategy") in selected]
     actionable = [s for s in signals if abs(s.get("edge", 0)) >= effective_min_edge]
-    # Enrich with OSINT (deterministic) before final ordering/selection. It is
-    # intentionally skipped for pure BTC 5m scalps because news is irrelevant on a
-    # 5-minute candle-betting horizon.
+    # OSINT enrichment skipped for pure BTC 5m scalps (news irrelevant on 5-min horizon)
     if not btc_only:
         actionable = await apply_osint_google_news(actionable)
     actionable, policy_rejected = apply_execution_filters(actionable, execution_policy)
-    # Rank with composite score + market/direction diversification
     for s in actionable:
-        strat = str(s.get("strategy") or "")
-        mult = float(strategy_multipliers.get(strat, 1.0) or 1.0)
+        mult = float(strategy_multipliers.get(str(s.get("strategy") or ""), 1.0) or 1.0)
         s["_learn_score"] = float(s.get("net_edge", s.get("edge", 0)) or 0) * mult
     actionable.sort(key=lambda x: float(x.get("_learn_score", x.get("net_edge", x.get("edge", 0))) or 0), reverse=True)
+    return actionable, policy_rejected
 
-    top_signals = select_best_orders(actionable, max_per_scan)
-    # Optional local LLM re-rank over already filtered picks
-    if llm_enabled and top_signals:
-        top_signals = await llm_select_signals(top_signals, max_per_scan, mode=llm_mode, url=llm_url)
 
+async def _execute_trades(
+    top_signals: List[Dict[str, Any]],
+    wallet: "Wallet",
+    execution_policy: Dict[str, Any],
+    min_trade: float,
+    max_trade: float,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Open paper positions for each top signal; return (executed, skipped) lists."""
     executed: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -706,21 +709,34 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
         try:
             raw_direction = str(sig.get("direction", "yes") or "yes").lower()
             if raw_direction not in {"yes", "no"}:
-                skipped.append({
-                    "market_slug": sig.get("event_slug", ""),
-                    "reason": f"unsupported signal direction for paper execution: {raw_direction}",
-                    "strategy": sig.get("strategy", ""),
-                })
+                skipped.append({"market_slug": sig.get("event_slug", ""), "reason": f"unsupported signal direction for paper execution: {raw_direction}", "strategy": sig.get("strategy", "")})
                 continue
 
             direction = raw_direction.upper()
-            entry_price = sig.get("market_probability", 0.5)
-            if direction == "NO":
-                entry_price = 1.0 - entry_price
+            market_lookup = str(sig.get("market_id", "") or "")
+            if not market_lookup:
+                skipped.append({"market_slug": sig.get("event_slug", ""), "reason": "missing market_id for CLOB execution quote", "strategy": sig.get("strategy", "")})
+                continue
 
-            suggested_size = sig.get("suggested_size", min_trade)
-            size = max(min_trade, min(suggested_size, max_trade))
+            quote_data = (await fetch_market_prices([market_lookup])).get(market_lookup)
+            if not quote_data or not quote_data.get("ok"):
+                skipped.append({"market_slug": sig.get("event_slug", ""), "reason": "missing executable CLOB quote", "strategy": sig.get("strategy", "")})
+                continue
 
+            entry_price = get_entry_quote(direction, quote_data)
+            if entry_price is None:
+                skipped.append({"market_slug": sig.get("event_slug", ""), "reason": f"missing {direction} BUY quote", "strategy": sig.get("strategy", "")})
+                continue
+
+            strat = str(sig.get("strategy", "") or "")
+            if strat == "btc_5m_momentum" and entry_price > float(execution_policy.get("btc_max_entry_price", PAPER_BTC_MAX_ENTRY_PRICE_EXEC)):
+                skipped.append({"market_slug": sig.get("event_slug", ""), "strategy": strat, "reason": "btc executable entry price above max"})
+                continue
+            if strat == "endgame_last_minute" and entry_price > float(execution_policy.get("endgame_max_entry_price", PAPER_ENDGAME_MAX_ENTRY_PRICE_EXEC)):
+                skipped.append({"market_slug": sig.get("event_slug", ""), "strategy": strat, "reason": "endgame executable entry price above max"})
+                continue
+
+            size = max(min_trade, min(sig.get("suggested_size", min_trade), max_trade))
             market_slug = sig.get("event_slug", sig.get("market_id", ""))
 
             pos = wallet.open_position(
@@ -734,14 +750,21 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
                     "event_title": sig.get("event_title", ""),
                     "strategy": sig.get("strategy", ""),
                     "model_probability": sig.get("model_probability"),
+                    "market_probability": sig.get("market_probability"),
                     "confidence": sig.get("confidence"),
                     "kelly_fraction": sig.get("kelly_fraction"),
+                    "price_source": quote_data.get("price_source"),
+                    "execution_model": "conservative_buy_ask_sell_bid",
+                    "execution_token_id": quote_data.get("yes_token_id") if direction == "YES" else quote_data.get("no_token_id"),
+                    "execution_outcome": quote_data.get("yes_outcome") if direction == "YES" else quote_data.get("no_outcome"),
+                    "trusted_for_pnl": True,
                 },
             )
             executed.append({
                 "market_slug": market_slug,
                 "side": direction,
                 "entry_price": entry_price,
+                "price_source": quote_data.get("price_source"),
                 "size": size,
                 "cost": pos["cost"],
                 "edge": sig.get("edge", 0),
@@ -756,8 +779,23 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
             logger.error("Failed to execute signal: %s", e)
             skipped.append({"market_slug": sig.get("event_slug", ""), "reason": f"error: {e}"})
 
-    status = wallet.get_status()
-    learning_info = learning_snapshot(ls)
+    return executed, skipped
+
+
+def _record_learning(
+    cycle_id: str,
+    all_signals: List[Dict[str, Any]],
+    selected: set,
+    effective_min_edge: float,
+    actionable: List[Dict[str, Any]],
+    policy_rejected: List[Dict[str, Any]],
+    top_signals: List[Dict[str, Any]],
+    executed: List[Dict[str, Any]],
+    skipped: List[Dict[str, Any]],
+    outcome_summary: Dict[str, Any],
+    entries_paused: bool = False,
+) -> Dict[str, Any]:
+    """Record signal decisions in the learning store and return the store summary."""
     try:
         decision_summary = record_signal_decisions(
             cycle_id=cycle_id,
@@ -769,18 +807,95 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
             top_signals=top_signals,
             executed=executed,
             skipped=skipped,
+            entries_paused=entries_paused,
         )
         store_summary = summarize_learning_events()
         store_summary.update({"last_cycle_decisions": decision_summary, "last_cycle_outcomes": outcome_summary})
+        return store_summary
     except Exception as e:
         logger.warning("Learning signal decision recording failed: %s", e)
-        store_summary = {"error": str(e)}
+        return {"error": str(e)}
+
+
+async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
+    """Full cycle: scan strategies → execute trades → settle positions.
+    Returns a comprehensive report dict.
+    """
+    if wallet is None:
+        wallet = Wallet()
+    cycle_id = new_cycle_id()
+
+    base_dir = Path(__file__).resolve().parent
+    sys.path.insert(0, str(base_dir))
+    from scanner import scan_all, scan_btc_5m_only
+
+    # Phase 1: settle existing positions
+    settlement_report = await settle_positions(wallet)
+
+    selected = _selected_strategies(PAPER_STRATEGY_MODE)
+    btc_only = selected == {'btc_5m_momentum'}
+
+    # Phase 2: scan for new signals
+    scan_result = await (scan_btc_5m_only() if btc_only else scan_all())
+    all_signals = list(scan_result.get("signals", []) or [])
+
+    try:
+        outcome_summary = observe_signal_outcomes_from_signals(all_signals)
+    except Exception as e:
+        logger.warning("Learning signal outcome update failed: %s", e)
+        outcome_summary = {"enabled": True, "error": str(e), "outcome_events": 0, "pending": 0}
+
+    # Phase 3: apply learning policy
+    settings = wallet.state.get("settings", {})
+    min_edge = settings.get("min_edge", 0.05)
+    wallet.state["last_strategy_mode"] = PAPER_STRATEGY_MODE
+    ls = ensure_learning_state(wallet.state)
+    policy = maybe_refresh_policy(ls, settings)
+    learning_enabled = bool(ls.get("enabled", True))
+    learning_shadow = bool(ls.get("shadow_mode", False))
+    effective_min_edge = float(policy.get("effective_min_edge", min_edge) or min_edge)
+    if (not learning_enabled) or learning_shadow:
+        effective_min_edge = float(min_edge)
+    strategy_multipliers = dict(policy.get("strategy_multipliers") or {})
+
+    if PAPER_DISABLE_NEW_ENTRIES:
+        skipped_paused = [{"market_slug": "*", "reason": "entries paused by circuit breaker"}]
+        store_summary = _record_learning(cycle_id, all_signals, selected, effective_min_edge, [], [], [], [], skipped_paused, outcome_summary, entries_paused=True)
+        wallet.save()
+        return {
+            "settlement": settlement_report,
+            "scan": {"total_markets": scan_result.get("total_markets", 0), "total_signals": scan_result.get("total_signals", 0), "actionable_signals": 0, "by_strategy": scan_result.get("by_strategy", {}), "strategy_mode": PAPER_STRATEGY_MODE, "min_edge_base": min_edge, "min_edge_effective": min_edge},
+            "execution": {"attempted": 0, "executed": 0, "skipped": 1, "trades": [], "skipped_reasons": skipped_paused},
+            "wallet": wallet.get_status(),
+            "learning": learning_snapshot(ls),
+            "learning_store": store_summary,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    execution_policy = execution_policy_from_settings(settings)
+    llm_enabled = bool(settings.get("llm_enabled", LLM_PAPER_ENABLED))
+    llm_mode = str(settings.get("llm_mode", LLM_PAPER_MODE) or LLM_PAPER_MODE)
+    llm_url = str(settings.get("llm_url", LLM_PAPER_URL) or LLM_PAPER_URL)
+    min_trade = settings.get("min_trade", 10)
+    max_trade = settings.get("max_trade", 50)
+    max_per_scan = settings.get("max_per_scan", 10)
+
+    # Phase 4: filter, rank, optional LLM re-rank
+    actionable, policy_rejected = await _filter_and_rank_signals(all_signals, selected, btc_only, effective_min_edge, strategy_multipliers, execution_policy)
+    top_signals = select_best_orders(actionable, max_per_scan)
+    if llm_enabled and top_signals:
+        top_signals = await llm_select_signals(top_signals, max_per_scan, mode=llm_mode, url=llm_url)
+
+    # Phase 5: open paper positions
+    executed, skipped = await _execute_trades(top_signals, wallet, execution_policy, min_trade, max_trade)
+
+    # Phase 6: learning store + save
+    store_summary = _record_learning(cycle_id, all_signals, selected, effective_min_edge, actionable, policy_rejected, top_signals, executed, skipped, outcome_summary)
     wallet.save()
 
     return {
         "settlement": settlement_report,
-            "scan": {
-
+        "scan": {
             "total_markets": scan_result.get("total_markets", 0),
             "total_signals": scan_result.get("total_signals", 0),
             "actionable_signals": len(actionable),
@@ -797,13 +912,13 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
             "skipped": len(skipped),
             "policy_rejected": len(policy_rejected),
             "trades": executed,
-            "skipped_reasons": (skipped + policy_rejected)[:5],  # top 5 skip reasons
+            "skipped_reasons": (skipped + policy_rejected)[:5],
             "execution_policy": execution_policy,
             "llm_enabled": llm_enabled,
             "llm_mode": llm_mode,
         },
-        "wallet": status,
-        "learning": learning_info,
+        "wallet": wallet.get_status(),
+        "learning": learning_snapshot(ls),
         "learning_store": store_summary,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -881,7 +996,7 @@ if __name__ == "__main__":
         elif mode == "full":
             report = await scan_and_trade(wallet)
         else:
-            print(f"Usage: python settlement.py [settle|full]")
+            print("Usage: python settlement.py [settle|full]")
             return
 
         base_dir = Path(__file__).resolve().parent

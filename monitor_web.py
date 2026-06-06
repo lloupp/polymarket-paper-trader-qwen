@@ -1,15 +1,19 @@
+import fcntl
 import json
 import os
 import re
 import subprocess
 import threading
+import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from datetime import datetime, timezone
 from urllib.parse import quote_plus
-from urllib.request import urlopen, Request
-import xml.etree.ElementTree as ET
-from learning import ensure_learning_state, learning_snapshot, default_learning_state
+from urllib.request import Request, urlopen
+
+from common import KNOWN_STRATEGIES
+from learning import default_learning_state, ensure_learning_state, learning_snapshot
 
 HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8090"))
@@ -25,16 +29,27 @@ PAPER_LOOP_PID_FILE = BASE / 'logs' / 'paper_loop.pid'
 RUNTIME_STATE_FILE = BASE / 'logs' / 'runtime_state.json'
 TIMELINE_REPORT_FILE = BASE / 'logs' / 'timeline_report.json'
 
-KNOWN_STRATEGIES = [
-    "btc_5m_momentum",
-    "endgame_last_minute",
-    "arbitrage",
-    "value",
-    "mean_reversion",
-    "volume_spike",
-    "smart_money",
-    "event_countdown",
-]
+def _host_is_local(host: str) -> bool:
+    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _require_token_when_exposed() -> None:
+    if not DASHBOARD_TOKEN and not _host_is_local(HOST):
+        raise SystemExit(
+            "DASHBOARD_TOKEN deve ser definido quando DASHBOARD_HOST nao for localhost/127.0.0.1"
+        )
+
+
+@contextmanager
+def wallet_file_lock(exclusive: bool):
+    WALLET.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = WALLET.with_suffix(WALLET.suffix + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def tail(path: Path, n=200):
@@ -170,7 +185,8 @@ def read_wallet_state() -> dict:
     if not WALLET.exists():
         return {}
     try:
-        return json.loads(WALLET.read_text(errors='ignore'))
+        with wallet_file_lock(exclusive=False):
+            return json.loads(WALLET.read_text(errors='ignore'))
     except Exception:
         return {}
 
@@ -187,9 +203,10 @@ def read_last_report_json() -> dict:
 
 def write_wallet_state(state: dict) -> None:
     WALLET.parent.mkdir(parents=True, exist_ok=True)
-    tmp = WALLET.with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True))
-    tmp.replace(WALLET)
+    with wallet_file_lock(exclusive=True):
+        tmp = WALLET.with_suffix(f'.json.{os.getpid()}.{threading.get_ident()}.tmp')
+        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True))
+        tmp.replace(WALLET)
 
 
 def read_runtime_state() -> dict:
@@ -369,6 +386,201 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ------------------------------------------------------------------
+    # POST endpoint handlers — each returns (http_status, response_dict)
+    # ------------------------------------------------------------------
+
+    def _handle_strategy(self, data):
+        mode = str(data.get('mode', '')).strip().lower()
+        modes = data.get('modes')
+        selected = []
+        if isinstance(modes, list):
+            selected = [str(x).strip().lower() for x in modes if str(x).strip()]
+        if mode == 'all':
+            write_configured_strategy('all')
+            return 200, {"ok": True, "mode": "all", "active": KNOWN_STRATEGIES}
+        if selected:
+            invalid = [m for m in selected if m not in KNOWN_STRATEGIES]
+            if invalid:
+                return 400, {"ok": False, "error": "invalid modes", "invalid": invalid, "allowed": KNOWN_STRATEGIES + ["all"]}
+            write_configured_strategy(','.join(selected))
+            active = _normalize_strategy_selection(','.join(selected))
+            return 200, {"ok": True, "mode": ','.join(active), "active": active}
+        if mode not in KNOWN_STRATEGIES:
+            return 400, {"ok": False, "error": "invalid mode", "allowed": KNOWN_STRATEGIES + ["all"]}
+        write_configured_strategy(mode)
+        return 200, {"ok": True, "mode": mode, "active": [mode]}
+
+    def _handle_loop_interval(self, data):
+        sec = int(data.get('interval_seconds', 0))
+        if sec < 30 or sec > 3600:
+            return 400, {"ok": False, "error": "interval_seconds fora do range", "min": 30, "max": 3600}
+        write_loop_seconds(sec)
+        return 200, {"ok": True, "interval_seconds": sec}
+
+    def _handle_control(self, data):
+        action = str(data.get('action', '')).strip().lower()
+        if action == 'run_once':
+            run_one_cycle_async()
+            return 200, {"ok": True, "action": action, "message": "ciclo manual disparado"}
+        if action == 'restart':
+            trigger_restart_async()
+            return 200, {"ok": True, "action": action, "message": "reinício disparado em background; dashboard pode ficar indisponível por alguns segundos"}
+        if action not in {'start', 'stop'}:
+            return 400, {"ok": False, "error": "invalid action", "allowed": ["start", "stop", "restart", "run_once"]}
+        p = run_control_script(action)
+        status = 200 if p.returncode == 0 else 500
+        return status, {"ok": p.returncode == 0, "action": action, "exit_code": p.returncode, "stdout": (p.stdout or '')[-2000:], "stderr": (p.stderr or '')[-2000:]}
+
+    def _handle_settings(self, data):
+        wallet = read_wallet_state()
+        if not wallet:
+            return 500, {"ok": False, "error": "wallet indisponivel"}
+        settings = wallet.get('settings', {})
+        settings['auto_risk_enabled'] = bool(data.get('auto_risk_enabled', settings.get('auto_risk_enabled', True)))
+
+        def _num(name, cast=float, min_v=None, max_v=None):
+            if name not in data:
+                return
+            v = cast(data.get(name))
+            if min_v is not None and v < min_v:
+                raise ValueError(f'{name} abaixo do mínimo {min_v}')
+            if max_v is not None and v > max_v:
+                raise ValueError(f'{name} acima do máximo {max_v}')
+            settings[name] = v
+
+        _num('max_exposure', float, 1, 1000000)
+        _num('max_trade', float, 0.5, 1000000)
+        _num('min_trade', float, 0.1, 1000000)
+        _num('max_per_scan', int, 1, 100)
+        _num('min_edge', float, 0.0, 1.0)
+        if 'llm_enabled' in data:
+            settings['llm_enabled'] = bool(data.get('llm_enabled'))
+        if 'llm_mode' in data:
+            llm_mode = str(data.get('llm_mode', 'fast')).strip().lower()
+            if llm_mode not in {'fast', 'balanced', 'strong'}:
+                return 400, {"ok": False, "error": "llm_mode invalido (fast|balanced|strong)"}
+            settings['llm_mode'] = llm_mode
+        if 'llm_url' in data:
+            llm_url = str(data.get('llm_url', '')).strip()
+            if not llm_url.startswith(('http://', 'https://')):
+                return 400, {"ok": False, "error": "llm_url deve iniciar com http:// ou https://"}
+            settings['llm_url'] = llm_url
+        _num('stop_loss', float, 0.01, 0.99)
+        _num('take_profit', float, 0.01, 5.0)
+        _num('cb_loss_seq', int, 2, 12)
+        _num('cb_loss_sum6', float, -500.0, -1.0)
+        _num('cb_cooldown_cycles', int, 1, 20)
+        _num('rot_window', int, 20, 400)
+        _num('rot_top_k', int, 1, len(KNOWN_STRATEGIES))
+        _num('rot_weight_winrate', float, 0.0, 1.0)
+        _num('rot_weight_pnl', float, 0.0, 1.0)
+        _num('min_net_edge', float, 0.0, 1.0)
+        _num('taker_fee_estimate', float, 0.0, 0.20)
+        _num('slippage_estimate', float, 0.0, 0.50)
+        _num('smart_money_max_spread', float, 0.0, 1.0)
+        _num('smart_money_min_liquidity', float, 0.0, 10000000)
+        _num('smart_money_min_vol24h', float, 0.0, 10000000)
+        _num('event_countdown_max_spread', float, 0.0, 1.0)
+        _num('event_countdown_min_liquidity', float, 0.0, 10000000)
+        _num('event_countdown_min_vol24h', float, 0.0, 10000000)
+        _num('btc_max_entry_price', float, 0.01, 0.99)
+        _num('btc_min_liquidity', float, 0.0, 10000000)
+        _num('endgame_max_entry_price', float, 0.01, 0.99)
+        _num('endgame_min_liquidity', float, 0.0, 10000000)
+        if 'shadow_strategies' in data:
+            raw_shadow = str(data.get('shadow_strategies', '')).strip().lower()
+            shadow = [x.strip() for x in raw_shadow.replace(';', ',').split(',') if x.strip()]
+            invalid_shadow = [x for x in shadow if x not in KNOWN_STRATEGIES]
+            if invalid_shadow:
+                return 400, {"ok": False, "error": "shadow_strategies invalido", "invalid": invalid_shadow, "allowed": KNOWN_STRATEGIES}
+            settings['shadow_strategies'] = ','.join(dict.fromkeys(shadow))
+
+        if settings.get('min_trade', 0) > settings.get('max_trade', 0):
+            return 400, {"ok": False, "error": "min_trade nao pode ser maior que max_trade"}
+        if settings.get('max_trade', 0) > settings.get('max_exposure', 0):
+            return 400, {"ok": False, "error": "max_trade nao pode ser maior que max_exposure"}
+        rw = float(settings.get('rot_weight_winrate', 0.7) or 0.7)
+        rp = float(settings.get('rot_weight_pnl', 0.3) or 0.3)
+        if abs((rw + rp) - 1.0) > 0.001:
+            return 400, {"ok": False, "error": "rot_weight_winrate + rot_weight_pnl deve somar 1.0"}
+
+        wallet['settings'] = settings
+        write_wallet_state(wallet)
+        return 200, {'ok': True, 'settings': wallet_controls_from_state(wallet)}
+
+    def _handle_settings_preset(self, data):
+        wallet = read_wallet_state()
+        if not wallet:
+            return 500, {"ok": False, "error": "wallet indisponivel"}
+        preset = str(data.get('preset', '')).strip().lower()
+        presets = {
+            'conservador': {'cb_loss_seq': 3, 'cb_loss_sum6': -15.0, 'cb_cooldown_cycles': 4, 'rot_window': 140, 'rot_top_k': 2, 'rot_weight_winrate': 0.8, 'rot_weight_pnl': 0.2, 'min_edge': 0.08, 'max_per_scan': 2},
+            'balanceado':  {'cb_loss_seq': 4, 'cb_loss_sum6': -25.0, 'cb_cooldown_cycles': 2, 'rot_window': 100, 'rot_top_k': 3, 'rot_weight_winrate': 0.7, 'rot_weight_pnl': 0.3, 'min_edge': 0.06, 'max_per_scan': 3},
+            'agressivo':   {'cb_loss_seq': 6, 'cb_loss_sum6': -45.0, 'cb_cooldown_cycles': 1, 'rot_window': 60,  'rot_top_k': 5, 'rot_weight_winrate': 0.55, 'rot_weight_pnl': 0.45, 'min_edge': 0.04, 'max_per_scan': 5},
+        }
+        if preset not in presets:
+            return 400, {'ok': False, 'error': 'preset inválido', 'allowed': list(presets.keys())}
+        settings = wallet.get('settings', {})
+        settings.update(presets[preset])
+        wallet['settings'] = settings
+        write_wallet_state(wallet)
+        return 200, {'ok': True, 'preset': preset, 'settings': wallet_controls_from_state(wallet)}
+
+    def _handle_learning_settings(self, data):
+        wallet = read_wallet_state()
+        if not wallet:
+            return 500, {"ok": False, "error": "wallet indisponivel"}
+        ls = ensure_learning_state(wallet)
+        if 'enabled' in data:
+            ls['enabled'] = bool(data.get('enabled'))
+        if 'shadow_mode' in data:
+            ls['shadow_mode'] = bool(data.get('shadow_mode'))
+        if 'min_samples' in data:
+            v = int(data.get('min_samples'))
+            if v < 5 or v > 500:
+                return 400, {"ok": False, "error": "min_samples fora do range [5,500]"}
+            ls['min_samples'] = v
+        if 'aggressiveness' in data:
+            a = str(data.get('aggressiveness', 'medium')).strip().lower()
+            if a not in {'low', 'medium', 'high'}:
+                return 400, {"ok": False, "error": "aggressiveness invalido (low|medium|high)"}
+            ls['aggressiveness'] = a
+        wallet['learning_state'] = ls
+        write_wallet_state(wallet)
+        return 200, {'ok': True, 'learning': learning_controls_from_state(wallet)}
+
+    def _handle_learning_reset(self, data):
+        wallet = read_wallet_state()
+        if not wallet:
+            return 500, {"ok": False, "error": "wallet indisponivel"}
+        prev = ensure_learning_state(wallet)
+        keep_cfg = {
+            'enabled': bool(prev.get('enabled', True)),
+            'shadow_mode': bool(prev.get('shadow_mode', False)),
+            'min_samples': int(prev.get('min_samples', 20)),
+            'aggressiveness': str(prev.get('aggressiveness', 'medium')),
+        }
+        fresh = default_learning_state()
+        fresh.update(keep_cfg)
+        wallet['learning_state'] = fresh
+        write_wallet_state(wallet)
+        return 200, {'ok': True, 'learning': learning_controls_from_state(wallet)}
+
+    # ------------------------------------------------------------------
+    # Dispatcher
+    # ------------------------------------------------------------------
+
+    _POST_ROUTES = {
+        '/api/strategy': '_handle_strategy',
+        '/api/loop_interval': '_handle_loop_interval',
+        '/api/control': '_handle_control',
+        '/api/settings': '_handle_settings',
+        '/api/settings_preset': '_handle_settings_preset',
+        '/api/learning_settings': '_handle_learning_settings',
+        '/api/learning_reset': '_handle_learning_reset',
+    }
+
     def do_POST(self):
         if not self._authorized():
             self._send(401, 'application/json; charset=utf-8', b'{"ok":false,"error":"unauthorized"}')
@@ -379,270 +591,13 @@ class H(BaseHTTPRequestHandler):
             raw = self.rfile.read(length) if length > 0 else b'{}'
             data = json.loads(raw.decode('utf-8') or '{}')
 
-            if path_only == '/api/strategy':
-                mode = str(data.get('mode', '')).strip().lower()
-                modes = data.get('modes')
-                selected = []
-                if isinstance(modes, list):
-                    selected = [str(x).strip().lower() for x in modes if str(x).strip()]
-                if mode == 'all':
-                    write_configured_strategy('all')
-                    payload = json.dumps({"ok": True, "mode": "all", "active": KNOWN_STRATEGIES}).encode('utf-8')
-                    self._send(200, 'application/json; charset=utf-8', payload)
-                    return
-                if selected:
-                    invalid = [m for m in selected if m not in KNOWN_STRATEGIES]
-                    if invalid:
-                        payload = json.dumps({"ok": False, "error": "invalid modes", "invalid": invalid, "allowed": KNOWN_STRATEGIES + ["all"]}).encode('utf-8')
-                        self._send(400, 'application/json; charset=utf-8', payload)
-                        return
-                    write_configured_strategy(','.join(selected))
-                    payload = json.dumps({"ok": True, "mode": ','.join(_normalize_strategy_selection(','.join(selected))), "active": _normalize_strategy_selection(','.join(selected))}).encode('utf-8')
-                    self._send(200, 'application/json; charset=utf-8', payload)
-                    return
-                if mode not in KNOWN_STRATEGIES:
-                    payload = json.dumps({"ok": False, "error": "invalid mode", "allowed": KNOWN_STRATEGIES + ["all"]}).encode('utf-8')
-                    self._send(400, 'application/json; charset=utf-8', payload)
-                    return
-                write_configured_strategy(mode)
-                payload = json.dumps({"ok": True, "mode": mode, "active": [mode]}).encode('utf-8')
-                self._send(200, 'application/json; charset=utf-8', payload)
+            handler_name = self._POST_ROUTES.get(path_only)
+            if handler_name is None:
+                self._send(404, 'application/json; charset=utf-8', b'{"error":"not found"}')
                 return
 
-            if path_only == '/api/loop_interval':
-                sec = int(data.get('interval_seconds', 0))
-                if sec < 30 or sec > 3600:
-                    payload = json.dumps({"ok": False, "error": "interval_seconds fora do range", "min": 30, "max": 3600}).encode('utf-8')
-                    self._send(400, 'application/json; charset=utf-8', payload)
-                    return
-                write_loop_seconds(sec)
-                payload = json.dumps({"ok": True, "interval_seconds": sec}).encode('utf-8')
-                self._send(200, 'application/json; charset=utf-8', payload)
-                return
-
-            if path_only == '/api/control':
-                action = str(data.get('action', '')).strip().lower()
-                if action == 'run_once':
-                    run_one_cycle_async()
-                    payload = json.dumps({"ok": True, "action": action, "message": "ciclo manual disparado"}).encode('utf-8')
-                    self._send(200, 'application/json; charset=utf-8', payload)
-                    return
-                if action == 'restart':
-                    trigger_restart_async()
-                    payload = json.dumps({
-                        "ok": True,
-                        "action": action,
-                        "message": "reinício disparado em background; dashboard pode ficar indisponível por alguns segundos"
-                    }).encode('utf-8')
-                    self._send(200, 'application/json; charset=utf-8', payload)
-                    return
-                if action not in {'start', 'stop'}:
-                    payload = json.dumps({"ok": False, "error": "invalid action", "allowed": ["start", "stop", "restart", "run_once"]}).encode('utf-8')
-                    self._send(400, 'application/json; charset=utf-8', payload)
-                    return
-                p = run_control_script(action)
-                payload = json.dumps({
-                    "ok": p.returncode == 0,
-                    "action": action,
-                    "exit_code": p.returncode,
-                    "stdout": (p.stdout or '')[-2000:],
-                    "stderr": (p.stderr or '')[-2000:],
-                }).encode('utf-8')
-                self._send(200 if p.returncode == 0 else 500, 'application/json; charset=utf-8', payload)
-                return
-
-            if path_only == '/api/settings':
-                wallet = read_wallet_state()
-                if not wallet:
-                    self._send(500, 'application/json; charset=utf-8', b'{"ok":false,"error":"wallet indisponivel"}')
-                    return
-                settings = wallet.get('settings', {})
-                auto_risk_enabled = bool(data.get('auto_risk_enabled', settings.get('auto_risk_enabled', True)))
-                settings['auto_risk_enabled'] = auto_risk_enabled
-
-                def _num(name, cast=float, min_v=None, max_v=None):
-                    if name not in data:
-                        return
-                    v = cast(data.get(name))
-                    if min_v is not None and v < min_v:
-                        raise ValueError(f'{name} abaixo do mínimo {min_v}')
-                    if max_v is not None and v > max_v:
-                        raise ValueError(f'{name} acima do máximo {max_v}')
-                    settings[name] = v
-
-                _num('max_exposure', float, 1, 1000000)
-                _num('max_trade', float, 0.5, 1000000)
-                _num('min_trade', float, 0.1, 1000000)
-                _num('max_per_scan', int, 1, 100)
-                _num('min_edge', float, 0.0, 1.0)
-                if 'llm_enabled' in data:
-                    settings['llm_enabled'] = bool(data.get('llm_enabled'))
-                if 'llm_mode' in data:
-                    llm_mode = str(data.get('llm_mode', 'fast')).strip().lower()
-                    if llm_mode not in {'fast', 'balanced', 'strong'}:
-                        self._send(400, 'application/json; charset=utf-8', b'{"ok":false,"error":"llm_mode invalido (fast|balanced|strong)"}')
-                        return
-                    settings['llm_mode'] = llm_mode
-                if 'llm_url' in data:
-                    llm_url = str(data.get('llm_url', '')).strip()
-                    if not llm_url.startswith(('http://', 'https://')):
-                        self._send(400, 'application/json; charset=utf-8', b'{"ok":false,"error":"llm_url deve iniciar com http:// ou https://"}')
-                        return
-                    settings['llm_url'] = llm_url
-                _num('stop_loss', float, 0.01, 0.99)
-                _num('take_profit', float, 0.01, 5.0)
-                _num('cb_loss_seq', int, 2, 12)
-                _num('cb_loss_sum6', float, -500.0, -1.0)
-                _num('cb_cooldown_cycles', int, 1, 20)
-                _num('rot_window', int, 20, 400)
-                _num('rot_top_k', int, 1, len(KNOWN_STRATEGIES))
-                _num('rot_weight_winrate', float, 0.0, 1.0)
-                _num('rot_weight_pnl', float, 0.0, 1.0)
-                _num('min_net_edge', float, 0.0, 1.0)
-                _num('taker_fee_estimate', float, 0.0, 0.20)
-                _num('slippage_estimate', float, 0.0, 0.50)
-                _num('smart_money_max_spread', float, 0.0, 1.0)
-                _num('smart_money_min_liquidity', float, 0.0, 10000000)
-                _num('smart_money_min_vol24h', float, 0.0, 10000000)
-                _num('event_countdown_max_spread', float, 0.0, 1.0)
-                _num('event_countdown_min_liquidity', float, 0.0, 10000000)
-                _num('event_countdown_min_vol24h', float, 0.0, 10000000)
-                _num('btc_max_entry_price', float, 0.01, 0.99)
-                _num('btc_min_liquidity', float, 0.0, 10000000)
-                _num('endgame_max_entry_price', float, 0.01, 0.99)
-                _num('endgame_min_liquidity', float, 0.0, 10000000)
-                if 'shadow_strategies' in data:
-                    raw_shadow = str(data.get('shadow_strategies', '')).strip().lower()
-                    shadow = [x.strip() for x in raw_shadow.replace(';', ',').split(',') if x.strip()]
-                    invalid_shadow = [x for x in shadow if x not in KNOWN_STRATEGIES]
-                    if invalid_shadow:
-                        payload = json.dumps({"ok": False, "error": "shadow_strategies invalido", "invalid": invalid_shadow, "allowed": KNOWN_STRATEGIES}).encode('utf-8')
-                        self._send(400, 'application/json; charset=utf-8', payload)
-                        return
-                    settings['shadow_strategies'] = ','.join(dict.fromkeys(shadow))
-
-                if settings.get('min_trade', 0) > settings.get('max_trade', 0):
-                    self._send(400, 'application/json; charset=utf-8', b'{"ok":false,"error":"min_trade nao pode ser maior que max_trade"}')
-                    return
-                if settings.get('max_trade', 0) > settings.get('max_exposure', 0):
-                    self._send(400, 'application/json; charset=utf-8', b'{"ok":false,"error":"max_trade nao pode ser maior que max_exposure"}')
-                    return
-                rw = float(settings.get('rot_weight_winrate', 0.7) or 0.7)
-                rp = float(settings.get('rot_weight_pnl', 0.3) or 0.3)
-                if abs((rw + rp) - 1.0) > 0.001:
-                    self._send(400, 'application/json; charset=utf-8', b'{"ok":false,"error":"rot_weight_winrate + rot_weight_pnl deve somar 1.0"}')
-                    return
-
-                wallet['settings'] = settings
-                write_wallet_state(wallet)
-                payload = json.dumps({'ok': True, 'settings': wallet_controls_from_state(wallet)}).encode('utf-8')
-                self._send(200, 'application/json; charset=utf-8', payload)
-                return
-
-            if path_only == '/api/settings_preset':
-                wallet = read_wallet_state()
-                if not wallet:
-                    self._send(500, 'application/json; charset=utf-8', b'{"ok":false,"error":"wallet indisponivel"}')
-                    return
-                preset = str(data.get('preset', '')).strip().lower()
-                presets = {
-                    'conservador': {
-                        'cb_loss_seq': 3,
-                        'cb_loss_sum6': -15.0,
-                        'cb_cooldown_cycles': 4,
-                        'rot_window': 140,
-                        'rot_top_k': 2,
-                        'rot_weight_winrate': 0.8,
-                        'rot_weight_pnl': 0.2,
-                        'min_edge': 0.08,
-                        'max_per_scan': 2,
-                    },
-                    'balanceado': {
-                        'cb_loss_seq': 4,
-                        'cb_loss_sum6': -25.0,
-                        'cb_cooldown_cycles': 2,
-                        'rot_window': 100,
-                        'rot_top_k': 3,
-                        'rot_weight_winrate': 0.7,
-                        'rot_weight_pnl': 0.3,
-                        'min_edge': 0.06,
-                        'max_per_scan': 3,
-                    },
-                    'agressivo': {
-                        'cb_loss_seq': 6,
-                        'cb_loss_sum6': -45.0,
-                        'cb_cooldown_cycles': 1,
-                        'rot_window': 60,
-                        'rot_top_k': 5,
-                        'rot_weight_winrate': 0.55,
-                        'rot_weight_pnl': 0.45,
-                        'min_edge': 0.04,
-                        'max_per_scan': 5,
-                    },
-                }
-                if preset not in presets:
-                    payload = json.dumps({'ok': False, 'error': 'preset inválido', 'allowed': list(presets.keys())}).encode('utf-8')
-                    self._send(400, 'application/json; charset=utf-8', payload)
-                    return
-                settings = wallet.get('settings', {})
-                settings.update(presets[preset])
-                wallet['settings'] = settings
-                write_wallet_state(wallet)
-                payload = json.dumps({'ok': True, 'preset': preset, 'settings': wallet_controls_from_state(wallet)}).encode('utf-8')
-                self._send(200, 'application/json; charset=utf-8', payload)
-                return
-
-            if path_only == '/api/learning_settings':
-                wallet = read_wallet_state()
-                if not wallet:
-                    self._send(500, 'application/json; charset=utf-8', b'{"ok":false,"error":"wallet indisponivel"}')
-                    return
-                ls = ensure_learning_state(wallet)
-
-                if 'enabled' in data:
-                    ls['enabled'] = bool(data.get('enabled'))
-                if 'shadow_mode' in data:
-                    ls['shadow_mode'] = bool(data.get('shadow_mode'))
-                if 'min_samples' in data:
-                    v = int(data.get('min_samples'))
-                    if v < 5 or v > 500:
-                        self._send(400, 'application/json; charset=utf-8', b'{"ok":false,"error":"min_samples fora do range [5,500]"}')
-                        return
-                    ls['min_samples'] = v
-                if 'aggressiveness' in data:
-                    a = str(data.get('aggressiveness', 'medium')).strip().lower()
-                    if a not in {'low', 'medium', 'high'}:
-                        self._send(400, 'application/json; charset=utf-8', b'{"ok":false,"error":"aggressiveness invalido (low|medium|high)"}')
-                        return
-                    ls['aggressiveness'] = a
-
-                wallet['learning_state'] = ls
-                write_wallet_state(wallet)
-                payload = json.dumps({'ok': True, 'learning': learning_controls_from_state(wallet)}).encode('utf-8')
-                self._send(200, 'application/json; charset=utf-8', payload)
-                return
-
-            if path_only == '/api/learning_reset':
-                wallet = read_wallet_state()
-                if not wallet:
-                    self._send(500, 'application/json; charset=utf-8', b'{"ok":false,"error":"wallet indisponivel"}')
-                    return
-                prev = ensure_learning_state(wallet)
-                keep_cfg = {
-                    'enabled': bool(prev.get('enabled', True)),
-                    'shadow_mode': bool(prev.get('shadow_mode', False)),
-                    'min_samples': int(prev.get('min_samples', 20)),
-                    'aggressiveness': str(prev.get('aggressiveness', 'medium')),
-                }
-                fresh = default_learning_state()
-                fresh.update(keep_cfg)
-                wallet['learning_state'] = fresh
-                write_wallet_state(wallet)
-                payload = json.dumps({'ok': True, 'learning': learning_controls_from_state(wallet)}).encode('utf-8')
-                self._send(200, 'application/json; charset=utf-8', payload)
-                return
-
-            self._send(404, 'application/json; charset=utf-8', b'{"error":"not found"}')
+            status, result = getattr(self, handler_name)(data)
+            self._send(status, 'application/json; charset=utf-8', json.dumps(result).encode('utf-8'))
         except Exception as e:
             payload = json.dumps({"ok": False, "error": str(e)}).encode('utf-8')
             self._send(500, 'application/json; charset=utf-8', payload)
@@ -747,7 +702,7 @@ canvas{width:100%;height:190px;background:#070d1a;border:1px solid var(--line);b
 <div class='top'><div class='h1'>Polymarket Paper Trader Dashboard</div><div class='badge' id='now'>atualizando...</div></div>
 <div class='grid'>
   <div class='card'><div class='kpi-title'>Bankroll atual</div><div id='bankroll' class='kpi-value'>$0</div><div id='bankrollSub' class='kpi-sub'>vs inicial</div></div>
-  <div class='card'><div class='kpi-title'>Lucro/Prejuízo (P&L)</div><div id='pnl' class='kpi-value'>$0</div><div class='kpi-sub'>paper trading</div></div>
+  <div class='card'><div class='kpi-title'>Lucro/Prejuízo (P&L)</div><div id='pnl' class='kpi-value'>$0</div><div id='pnlSub' class='kpi-sub'>paper trading</div></div>
   <div class='card'><div class='kpi-title'>Posições abertas</div><div id='openCount' class='kpi-value'>0</div><div class='kpi-sub'>exposição ativa</div></div>
   <div class='card'><div class='kpi-title'>Semáforo do ciclo</div><div id='cycleSem' class='sem neutro'>NEUTRO</div><div id='cycleReason' class='kpi-sub'>-</div></div>
 </div>
@@ -1002,9 +957,11 @@ function renderClosedTradesTimeline(wallet){
     const price = Number(t?.entry_price || 0).toFixed(3);
     const size = fmtMoney(t?.size || 0);
     const pnlColor = pnl>0 ? 'var(--good)' : (pnl<0 ? 'var(--bad)' : '#cbd5e1');
+    const trusted = t?.trusted_for_pnl !== false;
+    const audit = trusted ? '' : ` • <span class='sem ruim'>QUARENTENA</span>`;
     return `<article class='t-item ${cls}'>
       <div class='muted'>${fmtTs(t)}</div>
-      <div><b>${strat}</b> • <span class='tag ${side==='YES'?'yes':'no'}'>${side}</span></div>
+      <div><b>${strat}</b> • <span class='tag ${side==='YES'?'yes':'no'}'>${side}</span>${audit}</div>
       <div style='margin-top:3px'>${market.slice(0,88)}</div>
       <div class='muted' style='margin-top:2px'>entry ${price} • size ${size} • motivo ${reason}</div>
       <div style='margin-top:4px;font-weight:700;color:${pnlColor}'>P&L ${fmtPnl(pnl)}</div>
@@ -1295,12 +1252,17 @@ async function load(){
     const positionsRaw=w.positions||[];
     const positions=Array.isArray(positionsRaw)?positionsRaw:Object.values(positionsRaw);
     const bankroll=safe(w.bankroll,0), initial=safe(w.initial_bankroll,0), pnl=bankroll-initial;
+    const hist=Array.isArray(w.history)?w.history:[];
+    const trustedHist=hist.filter(t => t?.trusted_for_pnl !== false);
+    const quarantined=hist.length-trustedHist.length;
+    const trustedPnl=trustedHist.reduce((acc,t)=>acc+safe(t.realized_pnl ?? t.pnl,0),0);
     const exposureByPos=positions.reduce((acc,p)=>acc+safe(p.cost,safe(p.size,0)),0); const maxExposure=safe(settings.max_exposure,0);
     const riskPct=maxExposure>0?Math.min(100,(exposureByPos/maxExposure)*100):0;
 
     document.getElementById('now').textContent='Atualizado: '+new Date().toLocaleString('pt-BR');
     document.getElementById('bankroll').textContent=fmtMoney(bankroll); document.getElementById('bankrollSub').textContent='Inicial: '+fmtMoney(initial);
     const pnlEl=document.getElementById('pnl'); pnlEl.textContent=(pnl>=0?'+':'')+fmtMoney(pnl); pnlEl.style.color=pnl>=0?'var(--good)':'var(--bad)';
+    document.getElementById('pnlSub').textContent=`Confiável: ${(trustedPnl>=0?'+':'')+fmtMoney(trustedPnl)} | Quarentena: ${quarantined}`;
     document.getElementById('openCount').textContent=String(positions.length);
 
     const sem=d.cycle_signal||{level:'neutro',reason:'-'}; const semEl=document.getElementById('cycleSem');
@@ -1331,4 +1293,5 @@ load(); setInterval(load,10000);
 
 
 if __name__ == '__main__':
+    _require_token_when_exposed()
     ThreadingHTTPServer((HOST, PORT), H).serve_forever()
