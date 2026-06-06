@@ -996,13 +996,15 @@ async def detect_smart_money(markets: List[GammaMarket]) -> List[Signal]:
 
             smart_score = (1 / max(m.spread, 0.001)) * vol_ratio
 
-            # Direction from price change
-            if m.price_change_1d > 0.01:
+            # Direction from price change.
+            # Require stronger evidence for YES (29% historical WR vs 45% for NO).
+            # Flat markets default to NO: the uncertain zone (yes_price 0.5-0.6) had ~10% WR on YES.
+            if m.price_change_1d > 0.03:
                 direction = "yes"
             elif m.price_change_1d < -0.01:
                 direction = "no"
             else:
-                direction = "yes" if m.yes_price > 0.5 else "no"
+                direction = "no"
 
             move_edge = min(abs(m.price_change_1d) * 0.5, 0.10)
             vol_edge = min(vol_ratio / 30, 0.05)
