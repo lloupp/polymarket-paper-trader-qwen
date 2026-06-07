@@ -1503,8 +1503,8 @@ async def detect_endgame_last_minute(events: Optional[List[Dict[str, Any]]] = No
             if directional_edge < ENDGAME_MIN_DIRECTIONAL_EDGE:
                 continue
 
-            # Near-close markets with YES > 0.5 leave minimal upside — default NO unless recent momentum confirms.
-            direction = "yes" if m.price_change_1d > 0.02 else "no"
+            # Last-minute sniper: follow the side the market already favors (price reflects near-confirmed outcome).
+            direction = "yes" if m.yes_price > m.no_price else "no"
             entry_price = m.yes_price if direction == "yes" else m.no_price
             if entry_price <= 0 or entry_price >= ENDGAME_MAX_ENTRY_PRICE:
                 continue
