@@ -46,6 +46,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "btc_min_liquidity": 1000,
     "endgame_max_entry_price": 0.90,
     "endgame_min_liquidity": 1500,
+    "streak_size_min_mult": 0.5,
+    "streak_size_max_mult": 1.3,
+    "streak_loss_decay": 0.12,
+    "streak_win_boost": 0.07,
     "shadow_strategies": "arbitrage,value,mean_reversion,volume_spike,weather_forecast",
 }
 

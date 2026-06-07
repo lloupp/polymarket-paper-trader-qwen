@@ -704,6 +704,43 @@ async def _filter_and_rank_signals(
     return actionable, policy_rejected
 
 
+def _streak_size_multiplier(history: List[Dict[str, Any]], settings: Dict[str, Any], *, max_lookback: int = 6) -> float:
+    """Scale position size by the trailing win/loss streak.
+
+    Mirrors the trailing-streak walk in ops_runtime.circuit_breaker (losses_seq):
+    walk backwards from the most recent trusted close while the PnL sign holds.
+    Consecutive losses shrink size (risk-off after a bad run); consecutive wins
+    grow it moderately (both capped via settings so neither runs away).
+    """
+    hist = [h for h in history if h.get("trusted_for_pnl", True)]
+    last = hist[-max_lookback:]
+    pnls = [float(x.get("pnl", 0.0) or 0.0) for x in last]
+    if not pnls:
+        return 1.0
+
+    streak_len = 0
+    sign = 0
+    for p in reversed(pnls):
+        current_sign = 1 if p > 0 else (-1 if p < 0 else 0)
+        if current_sign == 0:
+            break
+        if sign == 0:
+            sign = current_sign
+        if current_sign != sign:
+            break
+        streak_len += 1
+
+    if sign < 0:
+        min_mult = float(settings.get("streak_size_min_mult", 0.5) or 0.5)
+        decay = float(settings.get("streak_loss_decay", 0.12) or 0.12)
+        return max(min_mult, 1.0 - decay * streak_len)
+    if sign > 0:
+        max_mult = float(settings.get("streak_size_max_mult", 1.3) or 1.3)
+        boost = float(settings.get("streak_win_boost", 0.07) or 0.07)
+        return min(max_mult, 1.0 + boost * streak_len)
+    return 1.0
+
+
 async def _execute_trades(
     top_signals: List[Dict[str, Any]],
     wallet: "Wallet",
@@ -746,7 +783,8 @@ async def _execute_trades(
                 skipped.append({"market_slug": sig.get("event_slug", ""), "strategy": strat, "reason": "endgame executable entry price above max"})
                 continue
 
-            size = max(min_trade, min(sig.get("suggested_size", min_trade), max_trade))
+            streak_mult = _streak_size_multiplier(wallet.state.get("history", []), wallet.state.get("settings", {}))
+            size = max(min_trade, min(sig.get("suggested_size", min_trade) * streak_mult, max_trade))
             market_slug = sig.get("event_slug", sig.get("market_id", ""))
 
             pos = wallet.open_position(
@@ -763,6 +801,7 @@ async def _execute_trades(
                     "market_probability": sig.get("market_probability"),
                     "confidence": sig.get("confidence"),
                     "kelly_fraction": sig.get("kelly_fraction"),
+                    "streak_multiplier": round(streak_mult, 4),
                     "price_source": quote_data.get("price_source"),
                     "execution_model": "conservative_buy_ask_sell_bid",
                     "execution_token_id": quote_data.get("yes_token_id") if direction == "YES" else quote_data.get("no_token_id"),

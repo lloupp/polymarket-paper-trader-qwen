@@ -71,6 +71,8 @@ BTC_5M_LATE_CONFIRM_MAX_PRICE = float(os.getenv("PAPER_BTC_5M_LATE_CONFIRM_MAX_P
 BTC_5M_MIN_LIQUIDITY = float(os.getenv("PAPER_BTC_5M_MIN_LIQUIDITY", "1000"))
 BTC_5M_HIGH_PRICE_PENALTY_START = float(os.getenv("PAPER_BTC_5M_HIGH_PRICE_PENALTY_START", "0.78"))
 BTC_5M_HIGH_PRICE_MAX_PENALTY = float(os.getenv("PAPER_BTC_5M_HIGH_PRICE_MAX_PENALTY", "0.045"))
+BTC_KLINES_API = os.getenv("PAPER_BTC_KLINES_API", "https://api.binance.com/api/v3/klines")
+BTC_KLINES_TIMEOUT_SECONDS = float(os.getenv("PAPER_BTC_KLINES_TIMEOUT_SECONDS", "5"))
 
 # BTC 5m Endgame (last-minute dedicated)
 ENDGAME_ENABLED = os.getenv("PAPER_ENDGAME_ENABLED", "1") == "1"
@@ -90,6 +92,7 @@ WEATHER_MAX_DAYS_AHEAD = int(os.getenv("PAPER_WEATHER_MAX_DAYS_AHEAD", "16"))
 WEATHER_TIMEOUT_SECONDS = float(os.getenv("PAPER_WEATHER_TIMEOUT_SECONDS", "8"))
 WEATHER_GEOCODE_API = os.getenv("PAPER_WEATHER_GEOCODE_API", "https://geocoding-api.open-meteo.com/v1/search")
 WEATHER_FORECAST_API = os.getenv("PAPER_WEATHER_FORECAST_API", "https://api.open-meteo.com/v1/forecast")
+WEATHER_ENSEMBLE_API = os.getenv("PAPER_WEATHER_ENSEMBLE_API", "https://ensemble-api.open-meteo.com/v1/ensemble")
 
 # Mean Reversion
 MEAN_REVERSION_THRESHOLD = 0.10   # 10% weekly move (primary)
@@ -108,6 +111,14 @@ VOLUME_SPIKE_MIN_VOL = 50000.0  # $50K 24h volume minimum
 SMART_MONEY_MAX_SPREAD = 0.05    # 5 cent spread (task spec); runtime default 0.01
 SMART_MONEY_VOLUME_RATIO = 2.0   # 2x category average
 SMART_MONEY_MIN_LIQUIDITY = 30000.0
+
+# Smart Money Copy-Trading (shadow-only — see strategy docstring)
+DATA_API = os.getenv("PAPER_POLYMARKET_DATA_API", "https://data-api.polymarket.com")
+SMART_MONEY_COPY_WALLETS = [w.strip() for w in os.getenv("PAPER_SMART_MONEY_WALLETS", "").split(",") if w.strip()]
+SMART_MONEY_COPY_TIMEOUT_SECONDS = float(os.getenv("PAPER_SMART_MONEY_COPY_TIMEOUT_SECONDS", "8"))
+SMART_MONEY_COPY_MIN_WIN_RATE = float(os.getenv("PAPER_SMART_MONEY_COPY_MIN_WIN_RATE", "0.60"))
+SMART_MONEY_COPY_MIN_PROFIT_FACTOR = float(os.getenv("PAPER_SMART_MONEY_COPY_MIN_PROFIT_FACTOR", "1.5"))
+SMART_MONEY_COPY_MAX_CONCENTRATION = float(os.getenv("PAPER_SMART_MONEY_COPY_MAX_CONCENTRATION", "0.30"))
 
 # Event Countdown
 EVENT_COUNTDOWN_MIN_HOURS = float(os.getenv("PAPER_EVENT_COUNTDOWN_MIN_HOURS", "0.25"))
@@ -471,6 +482,73 @@ def _weather_probability_from_forecast(spec: Dict[str, Any], forecast: Dict[str,
         return None
     yes_prob = 0.5 + max(-0.42, min(0.42, diff / (margin * 4.0)))
     return yes_prob, forecast_temp, f"{key}={forecast_temp:.1f} threshold={threshold:.1f} {spec.get('unit')}"
+
+
+def _ensemble_member_keys(hourly: Dict[str, Any], base: str) -> List[str]:
+    """Return sorted hourly keys for each ensemble member of a given base variable.
+
+    Open-Meteo names ensemble members as '<base>_member01', '<base>_member02', ...
+    (and sometimes a bare '<base>' for the control run, which we skip to keep a
+    consistent member set across variables).
+    """
+    prefix = f"{base}_member"
+    return sorted(k for k in hourly if k.startswith(prefix))
+
+
+def _weather_probability_from_ensemble(spec: Dict[str, Any], ensemble: Dict[str, Any], date_iso: str) -> Optional[Tuple[float, float, str]]:
+    hourly = ensemble.get("hourly") if isinstance(ensemble, dict) else None
+    if not isinstance(hourly, dict):
+        return None
+    times = list(hourly.get("time") or [])
+    day_idx = [i for i, t in enumerate(times) if isinstance(t, str) and t.startswith(date_iso)]
+    if not day_idx:
+        return None
+
+    if spec["metric"] == "rain":
+        member_keys = _ensemble_member_keys(hourly, "precipitation")
+        if not member_keys:
+            return None
+        sums = []
+        for key in member_keys:
+            values = hourly.get(key) or []
+            day_values = [float(values[i]) for i in day_idx if i < len(values) and values[i] is not None]
+            if day_values:
+                sums.append(sum(day_values))
+        if not sums:
+            return None
+        threshold_mm = 0.5  # measurable rain
+        hits = sum(1 for s in sums if s >= threshold_mm)
+        yes_prob = max(0.04, min(0.96, hits / len(sums)))
+        median_sum = sorted(sums)[len(sums) // 2]
+        return yes_prob, median_sum, f"ensemble_rain members={len(sums)} hits={hits} median_sum={median_sum:.1f}mm"
+
+    base = "temperature_2m"
+    member_keys = _ensemble_member_keys(hourly, base)
+    if not member_keys:
+        return None
+    threshold = float(spec["threshold"])
+    operator = spec.get("operator")
+    temp_kind = spec.get("temp_kind")
+    aggregates = []
+    for key in member_keys:
+        values = hourly.get(key) or []
+        day_values = [float(values[i]) for i in day_idx if i < len(values) and values[i] is not None]
+        if not day_values:
+            continue
+        aggregates.append(min(day_values) if temp_kind == "min" else max(day_values))
+    if not aggregates:
+        return None
+
+    def _meets(value: float) -> bool:
+        return value < threshold if operator == "below" else value > threshold
+
+    hits = sum(1 for v in aggregates if _meets(v))
+    yes_prob = max(0.04, min(0.96, hits / len(aggregates)))
+    median_value = sorted(aggregates)[len(aggregates) // 2]
+    return yes_prob, median_value, (
+        f"ensemble_{temp_kind or 'max'} members={len(aggregates)} hits={hits} "
+        f"median={median_value:.1f} threshold={threshold:.1f} {spec.get('unit')}"
+    )
 
 # ---------------------------------------------------------------------------
 # Market fetcher
@@ -1064,6 +1142,166 @@ async def detect_smart_money(markets: List[GammaMarket]) -> List[Signal]:
 
 
 # ---------------------------------------------------------------------------
+# Strategy 5b: Smart Money Copy-Trading (shadow-only, additive)
+#
+# detect_smart_money (above) is a microstructure proxy (spread+volume+momentum).
+# This is a *separate* strategy that follows real wallets via Polymarket's public
+# data-api, gated behind a manually curated allowlist (PAPER_SMART_MONEY_WALLETS —
+# the data-api has no leaderboard endpoint, so candidates must be picked from the
+# public leaderboard webpage). It must stay in PAPER_SHADOW_STRATEGIES until its
+# signals have been audited over real cycles — see feedback_strategy_pattern_caution
+# on not swapping live strategy logic without validation.
+# ---------------------------------------------------------------------------
+
+async def _fetch_trader_positions(client: httpx.AsyncClient, wallet_address: str) -> List[Dict[str, Any]]:
+    try:
+        resp = await client.get(
+            f"{DATA_API}/positions",
+            params={"user": wallet_address, "sortBy": "CASHPNL", "sortDirection": "DESC", "limit": 200},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.debug("Smart money copy: positions fetch failed for %s: %s", wallet_address, e)
+        return []
+
+
+async def _fetch_trader_trades(client: httpx.AsyncClient, wallet_address: str) -> List[Dict[str, Any]]:
+    try:
+        resp = await client.get(f"{DATA_API}/trades", params={"user": wallet_address, "limit": 100})
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.debug("Smart money copy: trades fetch failed for %s: %s", wallet_address, e)
+        return []
+
+
+def _trader_quality_score(positions: List[Dict[str, Any]], trades: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    """Replicate MrFadiAi/Polymarket-bot's smart-money filters: WR >= 60%, profit
+    factor >= 1.5, and no single closed position concentrating > 30% of total PnL.
+
+    Returns a quality dict if the wallet passes all filters, else None.
+    """
+    closed = [p for p in positions if bool(p.get("redeemable", False)) or not bool(p.get("active", True))]
+    pnls = [float(p.get("cashPnl", p.get("realizedPnl", 0.0)) or 0.0) for p in closed]
+    pnls = [p for p in pnls if p != 0.0]
+    if len(pnls) < 5:
+        return None
+
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    win_rate = len(wins) / len(pnls)
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+
+    total_abs_pnl = sum(abs(p) for p in pnls)
+    max_concentration = (max(abs(p) for p in pnls) / total_abs_pnl) if total_abs_pnl > 0 else 1.0
+
+    if win_rate < SMART_MONEY_COPY_MIN_WIN_RATE:
+        return None
+    if profit_factor < SMART_MONEY_COPY_MIN_PROFIT_FACTOR:
+        return None
+    if max_concentration > SMART_MONEY_COPY_MAX_CONCENTRATION:
+        return None
+
+    return {
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "max_concentration": max_concentration,
+        "sample_size": float(len(pnls)),
+    }
+
+
+async def detect_smart_money_copy(markets: List[GammaMarket]) -> List[Signal]:
+    """Follow real top-trader wallets (copy-trading), shadow-only.
+
+    For each wallet in PAPER_SMART_MONEY_WALLETS that passes _trader_quality_score,
+    cross-reference its currently open positions against the scanned markets. When
+    a tracked trader holds a side in a market we also see (and that market clears
+    the same liquidity/spread bar as detect_smart_money), emit a signal following
+    their side — sized by the relative weight of their position.
+
+    Empty PAPER_SMART_MONEY_WALLETS => dormant strategy (no signals, no API calls).
+    """
+    signals: List[Signal] = []
+    if not SMART_MONEY_COPY_WALLETS:
+        return signals
+
+    market_by_id = {m.market_id: m for m in markets}
+
+    async with httpx.AsyncClient(timeout=SMART_MONEY_COPY_TIMEOUT_SECONDS, trust_env=True) as client:
+        for wallet_address in SMART_MONEY_COPY_WALLETS:
+            try:
+                positions, trades = await asyncio.gather(
+                    _fetch_trader_positions(client, wallet_address),
+                    _fetch_trader_trades(client, wallet_address),
+                )
+                quality = _trader_quality_score(positions, trades)
+                if not quality:
+                    continue
+
+                open_positions = [p for p in positions if bool(p.get("active", True)) and not bool(p.get("redeemable", False))]
+                total_value = sum(abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0)) for p in open_positions) or 1.0
+
+                for p in open_positions:
+                    market_id = str(p.get("conditionId") or p.get("market") or p.get("asset") or "")
+                    m = market_by_id.get(market_id)
+                    if not m:
+                        continue
+                    if m.spread > SMART_MONEY_MAX_SPREAD or m.liquidity < SMART_MONEY_MIN_LIQUIDITY:
+                        continue
+
+                    outcome = str(p.get("outcome", "")).strip().lower()
+                    direction = "yes" if outcome in {"yes", "up"} else "no"
+                    entry_price = m.yes_price if direction == "yes" else m.no_price
+                    if entry_price <= 0.03 or entry_price >= 0.97:
+                        continue
+
+                    position_value = abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0))
+                    weight = min(1.0, position_value / total_value)
+                    edge = max(0.02, min(0.10, 0.03 + weight * 0.07))
+                    model_prob = (
+                        min(0.92, m.yes_price + edge) if direction == "yes"
+                        else max(0.08, m.yes_price - edge)
+                    )
+                    confidence = min(0.85, 0.40 + quality["win_rate"] * 0.35 + weight * 0.15)
+                    win_prob = model_prob if direction == "yes" else 1 - model_prob
+                    kelly_frac, size = kelly_size(win_prob, entry_price, conservative=0.4, max_fraction=0.03)
+
+                    signals.append(Signal(
+                        strategy="smart_money_copy",
+                        market_id=m.market_id,
+                        event_slug=_slug_or_question(m),
+                        event_title=_title_or_question(m),
+                        direction=direction,
+                        model_probability=model_prob,
+                        market_probability=m.yes_price,
+                        edge=edge,
+                        confidence=confidence,
+                        kelly_fraction=max(kelly_frac, 0.001),
+                        suggested_size=size,
+                        spread=m.spread,
+                        liquidity=m.liquidity,
+                        volume_24hr=m.volume_24hr,
+                        reasoning=(
+                            f"SMART_MONEY_COPY: wallet {wallet_address[:10]}… "
+                            f"WR:{quality['win_rate']:.0%} PF:{quality['profit_factor']:.1f} "
+                            f"side:{direction.upper()} weight:{weight:.0%} | {m.question[:50]}"
+                        ),
+                        sources=["gamma_api_markets", "polymarket_data_api", "smart_money_copy"],
+                    ))
+            except Exception as e:
+                logger.debug("Smart money copy failed for wallet %s: %s", wallet_address, e)
+
+    signals.sort(key=lambda s: s.confidence, reverse=True)
+    logger.info("Smart Money Copy: %d signals found", len(signals))
+    return signals
+
+
+# ---------------------------------------------------------------------------
 # Strategy 6: Event countdown (near resolution)
 # ---------------------------------------------------------------------------
 
@@ -1204,6 +1442,27 @@ async def _weather_forecast(client: httpx.AsyncClient, geo: Dict[str, Any], unit
         return None
 
 
+async def _weather_ensemble_forecast(client: httpx.AsyncClient, geo: Dict[str, Any], unit: str) -> Optional[Dict[str, Any]]:
+    try:
+        resp = await client.get(
+            WEATHER_ENSEMBLE_API,
+            params={
+                "latitude": geo["latitude"],
+                "longitude": geo["longitude"],
+                "hourly": "temperature_2m,precipitation",
+                "temperature_unit": unit,
+                "timezone": "auto",
+                "forecast_days": WEATHER_MAX_DAYS_AHEAD,
+                "models": "gfs_seamless",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.debug("Weather ensemble forecast failed for %s: %s", geo.get("name"), e)
+        return None
+
+
 async def detect_weather_forecast(
     markets: List[GammaMarket],
     now: Optional[datetime] = None,
@@ -1220,6 +1479,7 @@ async def detect_weather_forecast(
     now = now or datetime.now(timezone.utc)
     geocode_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     forecast_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+    ensemble_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
 
     async with httpx.AsyncClient(timeout=WEATHER_TIMEOUT_SECONDS, trust_env=False) as client:
         for m in markets:
@@ -1258,14 +1518,26 @@ async def detect_weather_forecast(
 
                 unit = str(spec.get("unit", "fahrenheit"))
                 cache_key = (location, unit)
-                forecast = forecast_cache.get(cache_key)
-                if cache_key not in forecast_cache:
-                    forecast = await _weather_forecast(client, geo, unit)
-                    forecast_cache[cache_key] = forecast
-                if not forecast:
-                    continue
 
-                probability = _weather_probability_from_forecast(spec, forecast, date_iso)
+                # Prefer the 31-member GFS ensemble: probability comes from counting
+                # how many members cross the market's threshold, not a heuristic curve.
+                ensemble = ensemble_cache.get(cache_key)
+                if cache_key not in ensemble_cache:
+                    ensemble = await _weather_ensemble_forecast(client, geo, unit)
+                    ensemble_cache[cache_key] = ensemble
+                probability = _weather_probability_from_ensemble(spec, ensemble, date_iso) if ensemble else None
+                forecast_source = "gfs_ensemble"
+
+                if not probability:
+                    forecast = forecast_cache.get(cache_key)
+                    if cache_key not in forecast_cache:
+                        forecast = await _weather_forecast(client, geo, unit)
+                        forecast_cache[cache_key] = forecast
+                    if not forecast:
+                        continue
+                    probability = _weather_probability_from_forecast(spec, forecast, date_iso)
+                    forecast_source = "single_point_fallback"
+
                 if not probability:
                     continue
                 yes_prob, forecast_value, forecast_note = probability
@@ -1305,11 +1577,11 @@ async def detect_weather_forecast(
                     liquidity=m.liquidity,
                     volume_24hr=m.volume_24hr,
                     reasoning=(
-                        f"WEATHER_FORECAST: {metric_label} {location_label} {date_iso} | "
+                        f"WEATHER_FORECAST[{forecast_source}]: {metric_label} {location_label} {date_iso} | "
                         f"{forecast_note} modelYES:{yes_prob:.0%} mktYES:{m.yes_price:.0%} "
                         f"dir:{direction.upper()} edge:{edge:.1%}"
                     ),
-                    sources=["gamma_api_markets", "open_meteo", "weather_forecast"],
+                    sources=["gamma_api_markets", "open_meteo", forecast_source],
                 ))
             except Exception as e:
                 logger.debug("Weather forecast detection failed for market %s: %s", m.market_id, e)
@@ -1358,6 +1630,56 @@ async def fetch_btc_5m_events(window_before: int = 1, window_after: int = 2) -> 
         results = await asyncio.gather(*(fetch_slug(slug) for slug in slugs))
     return [event for event in results if event]
 
+async def _fetch_btc_klines(client: httpx.AsyncClient, interval: str = "1m", limit: int = 20) -> Optional[List[float]]:
+    """Fetch recent BTC/USDT close prices from Binance's public klines endpoint.
+
+    Real spot price-action — independent of Polymarket's own implied odds — used
+    purely as a confirming signal for btc_5m_momentum (never to set direction).
+    """
+    try:
+        resp = await client.get(
+            BTC_KLINES_API,
+            params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
+            timeout=BTC_KLINES_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        return [float(candle[4]) for candle in data]
+    except Exception as e:
+        logger.debug("BTC klines fetch failed: %s", e)
+        return None
+
+
+def _compute_rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    """Classic Wilder RSI over the given close series."""
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(0.0, delta))
+        losses.append(max(0.0, -delta))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _compute_momentum(closes: List[float], lookback: int) -> Optional[float]:
+    """Percent change between the latest close and the close `lookback` candles back."""
+    if len(closes) <= lookback:
+        return None
+    base = closes[-1 - lookback]
+    if base == 0:
+        return None
+    return (closes[-1] - base) / base
+
+
 async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) -> List[Signal]:
     """Detect BTC 5m Up/Down momentum signals.
 
@@ -1373,6 +1695,26 @@ async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) 
         return signals
     if events is None:
         events = await fetch_btc_5m_events()
+
+    # Real BTC/USDT price action — fetched once per cycle (shared across all
+    # events, since they all track the same underlying). This is purely a
+    # confirmation signal: it never decides `direction`, only nudges
+    # confidence/sizing when it agrees or disagrees with the market consensus
+    # (see feedback_strategy_pattern_caution: btc_5m_momentum follows consensus).
+    rsi_14: Optional[float] = None
+    momentum_5m: Optional[float] = None
+    async with httpx.AsyncClient(timeout=BTC_KLINES_TIMEOUT_SECONDS, trust_env=True) as btc_client:
+        closes = await _fetch_btc_klines(btc_client, interval="1m", limit=20)
+    if closes:
+        rsi_14 = _compute_rsi(closes, period=14)
+        momentum_5m = _compute_momentum(closes, lookback=5)
+
+    price_action_side: Optional[str] = None
+    if rsi_14 is not None and momentum_5m is not None:
+        if rsi_14 > 55 and momentum_5m > 0:
+            price_action_side = "yes"
+        elif rsi_14 < 45 and momentum_5m < 0:
+            price_action_side = "no"
 
     now_ts = int(datetime.now(timezone.utc).timestamp())
     for event in events:
@@ -1423,6 +1765,20 @@ async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) 
             size_multiplier = 0.70 + min(directional_edge / 0.20, 1.0) * 0.60
             if entry_price > BTC_5M_HIGH_PRICE_PENALTY_START:
                 size_multiplier *= 0.60
+
+            # Real-price confirmation: nudge confidence/edge/size, never the direction.
+            price_action_note = "neutral"
+            if price_action_side is not None:
+                if price_action_side == direction:
+                    edge = min(0.30, edge + 0.01)
+                    confidence = min(0.92, confidence * 1.10)
+                    size_multiplier *= 1.10
+                    price_action_note = "confirms"
+                else:
+                    confidence *= 0.85
+                    size_multiplier *= 0.85
+                    price_action_note = "diverges"
+
             suggested_size = min(ADVANCED_MAX_TRADE_SIZE, BTC_5M_BASE_SIZE * size_multiplier)
             kelly_frac = min(0.05, suggested_size / max(INITIAL_BANKROLL, 1.0))
             side_label = "UP" if direction == "yes" else "DOWN"
@@ -1446,9 +1802,11 @@ async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) 
                 reasoning=(
                     f"BTC_5M_{entry_mode}: BUY {side_label} aos {seconds_in}s/300s | "
                     f"Up:{m.yes_price:.1%} Down:{m.no_price:.1%} entry:{entry_price:.1%} "
-                    f"edge:{edge:.1%} liq:${m.liquidity:,.0f} vol24h:${m.volume_24hr:,.0f}"
+                    f"edge:{edge:.1%} liq:${m.liquidity:,.0f} vol24h:${m.volume_24hr:,.0f} | "
+                    f"price_action:{price_action_note}"
+                    + (f" rsi14:{rsi_14:.0f} mom5m:{momentum_5m:+.2%}" if rsi_14 is not None and momentum_5m is not None else "")
                 ),
-                sources=["gamma_api_btc_5m", "ndjjwobaq_profile_inspired"],
+                sources=["gamma_api_btc_5m", "ndjjwobaq_profile_inspired", "binance_klines"],
             ))
         except Exception as e:
             logger.debug("BTC 5m momentum failed for event: %s", e)
@@ -1598,6 +1956,7 @@ async def scan_all() -> Dict[str, Any]:
         ("Mean Reversion", lambda: detect_mean_reversion(markets)),
         ("Volume Spike", lambda: detect_volume_spikes(markets)),
         ("Smart Money", lambda: detect_smart_money(markets)),
+        ("Smart Money Copy", lambda: detect_smart_money_copy(markets)),
         ("Event Countdown", lambda: detect_event_countdown(markets)),
         ("Weather Forecast", lambda: detect_weather_forecast(markets)),
     ]
