@@ -1100,13 +1100,9 @@ async def detect_event_countdown(markets: List[GammaMarket]) -> List[Signal]:
             if abs(m.yes_price - 0.5) < EVENT_COUNTDOWN_MID_BAND:
                 continue
 
-            # Require momentum for YES — flat markets default to NO (same fix as smart_money).
-            if m.price_change_1d > 0.02:
-                direction = "yes"
-            elif m.price_change_1d < -0.01:
-                direction = "no"
-            else:
-                direction = "no"
+            # Countdown sniper: as expiry nears, the market price IS the best estimate —
+            # follow the favored side with a small confidence boost (not a momentum bet).
+            direction = "yes" if m.yes_price > 0.5 else "no"
             market_anchor = m.yes_price if direction == "yes" else m.no_price
 
             # Boost increases as end approaches.
