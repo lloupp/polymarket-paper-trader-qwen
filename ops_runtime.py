@@ -82,6 +82,13 @@ def choose_mode_from_history(wallet: dict[str, Any]) -> str:
         scored.append((score, s))
     scored.sort(reverse=True)
     selected = [s for _, s in scored[:top_k]]
+    # Estratégias recomendadas sem nenhum trade na janela nunca pontuam e
+    # ficariam travadas fora do modo para sempre (sem trade -> sem histórico
+    # -> sem seleção). Inclua-as para que acumulem histórico; a lista
+    # PAPER_SHADOW_STRATEGIES continua vetando execução das rebaixadas.
+    for s in RECOMMENDED_MODE.split(","):
+        if s not in by and s not in selected:
+            selected.append(s)
     if "endgame_last_minute" not in selected:
         selected.append("endgame_last_minute")
     if "weather_forecast" not in selected:

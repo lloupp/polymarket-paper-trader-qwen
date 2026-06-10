@@ -16,6 +16,7 @@ from scanner import (
     _with_live_prices,
     detect_smart_money,
 )
+from ops_runtime import choose_mode_from_history
 from settlement import _streak_size_multiplier
 from wallet import DEFAULT_SETTINGS
 
@@ -170,6 +171,28 @@ class SmartMoneyLiveGameFilterTest(unittest.IsolatedAsyncioTestCase):
         non_sports = _smart_money_market("nonsports", None)
         signals = await detect_smart_money([non_sports])
         self.assertTrue(any(s.market_id == "nonsports" for s in signals))
+
+
+class StrategyRotationTest(unittest.TestCase):
+    def test_never_traded_recommended_strategies_are_included(self):
+        # Histórico só com smart_money: estratégias recomendadas sem trades
+        # (ex.: btc_5m_momentum) não podem ficar travadas fora do modo.
+        wallet = {
+            "settings": {},
+            "history": [
+                {"strategy": "smart_money", "pnl": 1.0, "trusted_for_pnl": True}
+                for _ in range(10)
+            ],
+        }
+        mode = choose_mode_from_history(wallet).split(",")
+        self.assertIn("smart_money", mode)
+        self.assertIn("btc_5m_momentum", mode)
+        self.assertIn("endgame_last_minute", mode)
+        self.assertIn("weather_forecast", mode)
+
+    def test_empty_history_returns_recommended_mode(self):
+        mode = choose_mode_from_history({"settings": {}, "history": []})
+        self.assertIn("btc_5m_momentum", mode)
 
 
 class ClobLivePriceTest(unittest.TestCase):
