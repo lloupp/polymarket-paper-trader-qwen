@@ -743,38 +743,38 @@ canvas{width:100%;height:190px;background:#070d1a;border:1px solid var(--line);b
 @keyframes actpulse{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.55)}50%{box-shadow:0 0 0 6px rgba(34,197,94,0)}}
 /* --- pista do robô (RPG) --- */
 .bot-track-card{margin-top:8px;padding:6px 14px 4px}
-.bot-track{position:relative;height:50px;border-bottom:2px dashed var(--line)}
-.bot-flag{position:absolute;right:2px;bottom:3px;font-size:15px}
-.bot-sprite{position:absolute;left:2%;bottom:3px;width:36px;height:39px;transition:left 1s linear}
-.bot-sprite .lay{position:absolute;top:0;left:0;width:3px;height:3px;background:transparent}
-/* corpo do robô em pixel art via box-shadow (1 "pixel" = 3px) */
+.bot-track{position:relative;height:78px;border-bottom:2px dashed var(--line)}
+.bot-flag{position:absolute;right:2px;bottom:3px;font-size:18px}
+.bot-sprite{position:absolute;left:2%;bottom:3px;width:60px;height:65px;transition:left 1s linear}
+.bot-sprite .lay{position:absolute;top:0;left:0;width:5px;height:5px;background:transparent}
+/* corpo do robô em pixel art via box-shadow (1 "pixel" = 5px) */
 .bot-sprite .body{box-shadow:
- 18px 0 0 0 #f59e0b,18px 3px 0 0 #94a3b8,
- 9px 6px 0 0 #7dd3fc,12px 6px 0 0 #7dd3fc,15px 6px 0 0 #7dd3fc,18px 6px 0 0 #7dd3fc,21px 6px 0 0 #7dd3fc,24px 6px 0 0 #7dd3fc,27px 6px 0 0 #7dd3fc,
- 9px 9px 0 0 #7dd3fc,12px 9px 0 0 #7dd3fc,15px 9px 0 0 #7dd3fc,18px 9px 0 0 #7dd3fc,21px 9px 0 0 #7dd3fc,24px 9px 0 0 #7dd3fc,27px 9px 0 0 #7dd3fc,
- 9px 12px 0 0 #7dd3fc,12px 12px 0 0 #7dd3fc,15px 12px 0 0 #0b1220,18px 12px 0 0 #7dd3fc,21px 12px 0 0 #0b1220,24px 12px 0 0 #7dd3fc,27px 12px 0 0 #7dd3fc,
- 9px 15px 0 0 #7dd3fc,12px 15px 0 0 #7dd3fc,15px 15px 0 0 #7dd3fc,18px 15px 0 0 #7dd3fc,21px 15px 0 0 #7dd3fc,24px 15px 0 0 #7dd3fc,27px 15px 0 0 #7dd3fc,
- 12px 18px 0 0 #0ea5e9,15px 18px 0 0 #0ea5e9,18px 18px 0 0 #0ea5e9,21px 18px 0 0 #0ea5e9,24px 18px 0 0 #0ea5e9,
- 12px 21px 0 0 #0ea5e9,15px 21px 0 0 #0ea5e9,18px 21px 0 0 #7dd3fc,21px 21px 0 0 #0ea5e9,24px 21px 0 0 #0ea5e9,
- 12px 24px 0 0 #0ea5e9,15px 24px 0 0 #0ea5e9,18px 24px 0 0 #0ea5e9,21px 24px 0 0 #0ea5e9,24px 24px 0 0 #0ea5e9,
- 12px 27px 0 0 #0ea5e9,15px 27px 0 0 #0ea5e9,18px 27px 0 0 #0ea5e9,21px 27px 0 0 #0ea5e9,24px 27px 0 0 #0ea5e9,
- 9px 18px 0 0 #94a3b8,9px 21px 0 0 #94a3b8,27px 18px 0 0 #94a3b8,27px 21px 0 0 #94a3b8}
+ 30px 0 0 0 #f59e0b,30px 5px 0 0 #94a3b8,
+ 15px 10px 0 0 #7dd3fc,20px 10px 0 0 #7dd3fc,25px 10px 0 0 #7dd3fc,30px 10px 0 0 #7dd3fc,35px 10px 0 0 #7dd3fc,40px 10px 0 0 #7dd3fc,45px 10px 0 0 #7dd3fc,
+ 15px 15px 0 0 #7dd3fc,20px 15px 0 0 #7dd3fc,25px 15px 0 0 #7dd3fc,30px 15px 0 0 #7dd3fc,35px 15px 0 0 #7dd3fc,40px 15px 0 0 #7dd3fc,45px 15px 0 0 #7dd3fc,
+ 15px 20px 0 0 #7dd3fc,20px 20px 0 0 #7dd3fc,25px 20px 0 0 #0b1220,30px 20px 0 0 #7dd3fc,35px 20px 0 0 #0b1220,40px 20px 0 0 #7dd3fc,45px 20px 0 0 #7dd3fc,
+ 15px 25px 0 0 #7dd3fc,20px 25px 0 0 #7dd3fc,25px 25px 0 0 #7dd3fc,30px 25px 0 0 #7dd3fc,35px 25px 0 0 #7dd3fc,40px 25px 0 0 #7dd3fc,45px 25px 0 0 #7dd3fc,
+ 20px 30px 0 0 #0ea5e9,25px 30px 0 0 #0ea5e9,30px 30px 0 0 #0ea5e9,35px 30px 0 0 #0ea5e9,40px 30px 0 0 #0ea5e9,
+ 20px 35px 0 0 #0ea5e9,25px 35px 0 0 #0ea5e9,30px 35px 0 0 #7dd3fc,35px 35px 0 0 #0ea5e9,40px 35px 0 0 #0ea5e9,
+ 20px 40px 0 0 #0ea5e9,25px 40px 0 0 #0ea5e9,30px 40px 0 0 #0ea5e9,35px 40px 0 0 #0ea5e9,40px 40px 0 0 #0ea5e9,
+ 20px 45px 0 0 #0ea5e9,25px 45px 0 0 #0ea5e9,30px 45px 0 0 #0ea5e9,35px 45px 0 0 #0ea5e9,40px 45px 0 0 #0ea5e9,
+ 15px 30px 0 0 #94a3b8,15px 35px 0 0 #94a3b8,45px 30px 0 0 #94a3b8,45px 35px 0 0 #94a3b8}
 /* pernas: frame 1 (juntas) e frame 2 (passada) */
-.bot-sprite .f1{box-shadow:15px 30px 0 0 #94a3b8,21px 30px 0 0 #94a3b8,15px 33px 0 0 #94a3b8,21px 33px 0 0 #94a3b8,12px 36px 0 0 #64748b,15px 36px 0 0 #64748b,21px 36px 0 0 #64748b,24px 36px 0 0 #64748b}
-.bot-sprite .f2{box-shadow:12px 30px 0 0 #94a3b8,24px 30px 0 0 #94a3b8,9px 33px 0 0 #94a3b8,24px 33px 0 0 #94a3b8,6px 36px 0 0 #64748b,9px 36px 0 0 #64748b,24px 36px 0 0 #64748b,27px 36px 0 0 #64748b;opacity:0}
+.bot-sprite .f1{box-shadow:25px 50px 0 0 #94a3b8,35px 50px 0 0 #94a3b8,25px 55px 0 0 #94a3b8,35px 55px 0 0 #94a3b8,20px 60px 0 0 #64748b,25px 60px 0 0 #64748b,35px 60px 0 0 #64748b,40px 60px 0 0 #64748b}
+.bot-sprite .f2{box-shadow:20px 50px 0 0 #94a3b8,40px 50px 0 0 #94a3b8,15px 55px 0 0 #94a3b8,40px 55px 0 0 #94a3b8,10px 60px 0 0 #64748b,15px 60px 0 0 #64748b,40px 60px 0 0 #64748b,45px 60px 0 0 #64748b;opacity:0}
 .bot-sprite.walking{animation:botbob .6s steps(2) infinite}
 .bot-sprite.walking .f1{animation:legA .5s steps(1) infinite}
 .bot-sprite.walking .f2{animation:legB .5s steps(1) infinite}
-@keyframes botbob{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
+@keyframes botbob{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
 @keyframes legA{0%,49%{opacity:1}50%,100%{opacity:0}}
 @keyframes legB{0%,49%{opacity:0}50%,100%{opacity:1}}
 .bot-sprite.sleeping{filter:grayscale(1) brightness(.65)}
 .bot-sprite.celebrating{animation:botjump .45s ease-in-out infinite}
-@keyframes botjump{0%,100%{transform:translateY(0)}50%{transform:translateY(-11px)}}
-.bot-bubble{position:absolute;top:-15px;left:28px;font-size:11px;color:var(--muted);white-space:nowrap}
+@keyframes botjump{0%,100%{transform:translateY(0)}50%{transform:translateY(-16px)}}
+.bot-bubble{position:absolute;top:-18px;left:48px;font-size:13px;color:var(--muted);white-space:nowrap}
 .bot-sprite.sleeping .bot-bubble{animation:zfloat 2s ease-in-out infinite}
-@keyframes zfloat{0%,100%{transform:translateY(0);opacity:.6}50%{transform:translateY(-4px);opacity:1}}
-.bot-coin{position:absolute;bottom:30px;font-size:13px;opacity:0;pointer-events:none}
+@keyframes zfloat{0%,100%{transform:translateY(0);opacity:.6}50%{transform:translateY(-5px);opacity:1}}
+.bot-coin{position:absolute;bottom:50px;font-size:16px;opacity:0;pointer-events:none}
 .bot-sprite.celebrating ~ .bot-coin{animation:coinup 1s ease-out infinite}
 @keyframes coinup{0%{opacity:0;transform:translateY(8px)}25%{opacity:1}100%{opacity:0;transform:translateY(-18px)}}
 .bot-caption{font-size:11px;margin-top:4px}
