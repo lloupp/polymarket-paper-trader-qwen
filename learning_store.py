@@ -313,6 +313,11 @@ def record_signal_decisions(
 
     pending = load_pending(pending_file)
     decision_counts: Dict[str, int] = {}
+    # One in-flight outcome observation per signal_key: the same signal is
+    # re-emitted every cycle (~250/cycle at 45s), so without dedup the pending
+    # buffer fills with autocorrelated duplicates and _trim_pending evicts
+    # entries before the 30-min horizon matures — zero outcomes ever recorded.
+    pending_keys = {str(e.get("signal_key") or "") for e in pending.get("signals", {}).values()}
 
     for idx, signal in enumerate(signals):
         decision, stage, reason, enriched_signal = _decision_from_signal(
@@ -349,18 +354,21 @@ def record_signal_decisions(
             "signal": snap,
         }
         append_event(event, event_log=event_log)
-        pending["signals"][sid] = {
-            "signal_id": sid,
-            "signal_key": signal_key(signal),
-            "cycle_id": cycle_id,
-            "observed_at": observed_at.isoformat(),
-            "outcome_due_at": due_at.isoformat(),
-            "decision": decision,
-            "stage": stage,
-            "reason": reason,
-            "entry_side_price": snap["entry_side_price"],
-            "signal": snap,
-        }
+        skey = signal_key(signal)
+        if skey not in pending_keys:
+            pending_keys.add(skey)
+            pending["signals"][sid] = {
+                "signal_id": sid,
+                "signal_key": skey,
+                "cycle_id": cycle_id,
+                "observed_at": observed_at.isoformat(),
+                "outcome_due_at": due_at.isoformat(),
+                "decision": decision,
+                "stage": stage,
+                "reason": reason,
+                "entry_side_price": snap["entry_side_price"],
+                "signal": snap,
+            }
 
     _trim_pending(pending, max_pending)
     save_pending(pending, pending_file)
