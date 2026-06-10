@@ -424,6 +424,41 @@ def _parse_weather_metric(text: str) -> Optional[Dict[str, Any]]:
     if not any(k in lower for k in ["temperature", "temp", "degrees", "°", "fahrenheit", "celsius"]):
         return None
 
+    temp_kind = "min" if re.search(r"\b(low|min|minimum)\b", lower) else "max"
+
+    def _band_spec(low: float | None, high: float | None, unit_raw: str) -> dict[str, Any]:
+        # Official readings are integers, so a bucket like "27°C" resolves YES
+        # for any continuous value in [26.5, 27.5) — hence the ±0.5 edges.
+        unit = "celsius" if unit_raw.startswith("c") else "fahrenheit"
+        return {
+            "metric": "temperature",
+            "operator": "band",
+            "band_low": low - 0.5 if low is not None else None,
+            "band_high": high + 0.5 if high is not None else None,
+            "unit": unit,
+            "temp_kind": temp_kind,
+        }
+
+    # Exact-bucket markets ("be 27°C", "between 80-81°F", "33°C or higher"):
+    # the dominant phrasing on Polymarket daily-temperature markets.
+    between = re.search(
+        r"between\s+(-?\d+(?:\.\d+)?)\s*(?:°\s*([cf]))?\s*(?:-|–|to|and)\s*(-?\d+(?:\.\d+)?)\s*°\s*([cf])\b",
+        lower,
+    )
+    if between:
+        lo, hi = float(between.group(1)), float(between.group(3))
+        return _band_spec(min(lo, hi), max(lo, hi), between.group(4) or between.group(2) or "f")
+    or_higher = re.search(r"(-?\d+(?:\.\d+)?)\s*°\s*([cf])\s*or\s+(?:higher|above|more|warmer)\b", lower)
+    if or_higher:
+        return _band_spec(float(or_higher.group(1)), None, or_higher.group(2))
+    or_lower = re.search(r"(-?\d+(?:\.\d+)?)\s*°\s*([cf])\s*or\s+(?:lower|below|less|colder)\b", lower)
+    if or_lower:
+        return _band_spec(None, float(or_lower.group(1)), or_lower.group(2))
+    exact = re.search(r"\bbe\s+(-?\d+(?:\.\d+)?)\s*°\s*([cf])\b", lower)
+    if exact:
+        value = float(exact.group(1))
+        return _band_spec(value, value, exact.group(2))
+
     op_match = re.search(
         r"\b(above|over|at least|exceed(?:s)?|greater than|below|under|less than|at most)\b[^0-9-]*(-?\d+(?:\.\d+)?)\s*(?:°?\s*([fc])|degrees?\s*(fahrenheit|celsius)?)?",
         lower,
@@ -435,7 +470,6 @@ def _parse_weather_metric(text: str) -> Optional[Dict[str, Any]]:
     threshold = float(op_match.group(2))
     unit_raw = (op_match.group(3) or op_match.group(4) or "f").lower()
     unit = "celsius" if unit_raw.startswith("c") else "fahrenheit"
-    temp_kind = "min" if re.search(r"\b(low|min|minimum)\b", lower) else "max"
     return {
         "metric": "temperature",
         "operator": operator,
@@ -473,6 +507,11 @@ def _weather_probability_from_forecast(spec: Dict[str, Any], forecast: Dict[str,
         amount_boost = min(0.25, precip_sum / 10.0)
         yes_prob = max(0.03, min(0.97, precip_prob * 0.85 + amount_boost))
         return yes_prob, precip_sum, f"rain_prob={precip_prob:.0%} precip_sum={precip_sum:.1f}mm"
+
+    if spec.get("operator") == "band":
+        # A single point forecast can't calibrate a 1-degree bucket probability;
+        # band markets are ensemble-only.
+        return None
 
     key = "temperature_2m_min" if spec.get("temp_kind") == "min" else "temperature_2m_max"
     temps = daily.get(key) or []
@@ -532,7 +571,6 @@ def _weather_probability_from_ensemble(spec: Dict[str, Any], ensemble: Dict[str,
     member_keys = _ensemble_member_keys(hourly, base)
     if not member_keys:
         return None
-    threshold = float(spec["threshold"])
     operator = spec.get("operator")
     temp_kind = spec.get("temp_kind")
     aggregates = []
@@ -545,15 +583,27 @@ def _weather_probability_from_ensemble(spec: Dict[str, Any], ensemble: Dict[str,
     if not aggregates:
         return None
 
-    def _meets(value: float) -> bool:
-        return value < threshold if operator == "below" else value > threshold
+    if operator == "band":
+        lo, hi = spec.get("band_low"), spec.get("band_high")
+
+        def _meets(value: float) -> bool:
+            return (lo is None or value >= lo) and (hi is None or value < hi)
+
+        bounds_label = f"band=[{lo if lo is not None else '-inf'},{hi if hi is not None else '+inf'})"
+    else:
+        threshold = float(spec["threshold"])
+
+        def _meets(value: float) -> bool:
+            return value < threshold if operator == "below" else value > threshold
+
+        bounds_label = f"threshold={threshold:.1f}"
 
     hits = sum(1 for v in aggregates if _meets(v))
     yes_prob = max(0.04, min(0.96, hits / len(aggregates)))
     median_value = sorted(aggregates)[len(aggregates) // 2]
     return yes_prob, median_value, (
         f"ensemble_{temp_kind or 'max'} members={len(aggregates)} hits={hits} "
-        f"median={median_value:.1f} threshold={threshold:.1f} {spec.get('unit')}"
+        f"median={median_value:.1f} {bounds_label} {spec.get('unit')}"
     )
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from scanner import (
     _compute_momentum,
     _compute_rsi,
     _parse_clob_token_ids,
+    _parse_weather_metric,
     _trader_quality_score,
     _weather_probability_from_ensemble,
     _with_live_prices,
@@ -171,6 +172,60 @@ class SmartMoneyLiveGameFilterTest(unittest.IsolatedAsyncioTestCase):
         non_sports = _smart_money_market("nonsports", None)
         signals = await detect_smart_money([non_sports])
         self.assertTrue(any(s.market_id == "nonsports" for s in signals))
+
+
+class WeatherBandParsingTest(unittest.TestCase):
+    def test_exact_bucket_celsius(self):
+        spec = _parse_weather_metric("Will the highest temperature in Hong Kong be 27°C on June 9?")
+        self.assertEqual(spec["operator"], "band")
+        self.assertEqual(spec["unit"], "celsius")
+        self.assertAlmostEqual(spec["band_low"], 26.5)
+        self.assertAlmostEqual(spec["band_high"], 27.5)
+
+    def test_between_range_fahrenheit(self):
+        spec = _parse_weather_metric("Will the highest temperature in New York City be between 80-81°F on June 9?")
+        self.assertEqual(spec["operator"], "band")
+        self.assertEqual(spec["unit"], "fahrenheit")
+        self.assertAlmostEqual(spec["band_low"], 79.5)
+        self.assertAlmostEqual(spec["band_high"], 81.5)
+
+    def test_or_higher_open_band(self):
+        spec = _parse_weather_metric("Will the highest temperature in Hong Kong be 33°C or higher on June 10?")
+        self.assertEqual(spec["operator"], "band")
+        self.assertAlmostEqual(spec["band_low"], 32.5)
+        self.assertIsNone(spec["band_high"])
+
+    def test_or_lower_open_band(self):
+        spec = _parse_weather_metric("Will the highest temperature in Hong Kong be 24°C or lower on June 10?")
+        self.assertEqual(spec["operator"], "band")
+        self.assertIsNone(spec["band_low"])
+        self.assertAlmostEqual(spec["band_high"], 24.5)
+
+    def test_above_threshold_still_works(self):
+        spec = _parse_weather_metric("Will the temperature in Miami be above 90 degrees Fahrenheit on June 12?")
+        self.assertEqual(spec["operator"], "above")
+        self.assertAlmostEqual(spec["threshold"], 90.0)
+
+    def test_band_probability_from_ensemble(self):
+        spec = {
+            "metric": "temperature", "operator": "band",
+            "band_low": 26.5, "band_high": 27.5,
+            "unit": "celsius", "temp_kind": "max",
+        }
+        ensemble = {
+            "hourly": {
+                "time": ["2026-06-10T00:00", "2026-06-10T12:00"],
+                "temperature_2m_member01": [20.0, 27.1],  # max 27.1 -> dentro
+                "temperature_2m_member02": [20.0, 26.2],  # max 26.2 -> fora
+                "temperature_2m_member03": [20.0, 27.4],  # max 27.4 -> dentro
+                "temperature_2m_member04": [20.0, 28.0],  # max 28.0 -> fora
+            }
+        }
+        result = _weather_probability_from_ensemble(spec, ensemble, "2026-06-10")
+        self.assertIsNotNone(result)
+        yes_prob, _, note = result
+        self.assertAlmostEqual(yes_prob, 0.5)
+        self.assertIn("band=[26.5,27.5)", note)
 
 
 class StrategyRotationTest(unittest.TestCase):
