@@ -198,6 +198,7 @@ class GammaMarket:
     price_change_1d: float = 0.0
     end_date: Optional[datetime] = None
     game_start_time: datetime | None = None
+    condition_id: str = ""
     active: bool = True
     closed: bool = False
     group_item_title: str = ""
@@ -666,6 +667,7 @@ def _parse_market(m: dict) -> Optional[GammaMarket]:
         price_change_1d=float(m.get("oneDayPriceChange", 0) or m.get("priceChange24hr", 0) or 0),
         end_date=end_date,
         game_start_time=game_start_time,
+        condition_id=str(m.get("conditionId", "") or ""),
         active=bool(m.get("active", True)),
         closed=bool(m.get("closed", False)),
         group_item_title=str(m.get("groupItemTitle", "") or ""),
@@ -1351,7 +1353,9 @@ async def detect_smart_money_copy(markets: List[GammaMarket]) -> List[Signal]:
     if not SMART_MONEY_COPY_WALLETS:
         return signals
 
-    market_by_id = {m.market_id: m for m in markets}
+    # Trader positions reference markets by conditionId (0x… hash), not by the
+    # numeric Gamma id, so the cross-reference index must use condition_id.
+    market_by_id = {m.condition_id: m for m in markets if m.condition_id}
 
     async with httpx.AsyncClient(timeout=SMART_MONEY_COPY_TIMEOUT_SECONDS, trust_env=True) as client:
         for wallet_address in SMART_MONEY_COPY_WALLETS:
@@ -1370,8 +1374,8 @@ async def detect_smart_money_copy(markets: List[GammaMarket]) -> List[Signal]:
                 total_value = sum(abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0)) for p in open_positions) or 1.0
 
                 for p in open_positions:
-                    market_id = str(p.get("conditionId") or p.get("market") or p.get("asset") or "")
-                    m = market_by_id.get(market_id)
+                    condition_id = str(p.get("conditionId") or "")
+                    m = market_by_id.get(condition_id)
                     if not m:
                         continue
                     if m.spread > SMART_MONEY_MAX_SPREAD or m.liquidity < SMART_MONEY_MIN_LIQUIDITY:
