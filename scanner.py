@@ -78,6 +78,10 @@ BTC_KLINES_TIMEOUT_SECONDS = float(os.getenv("PAPER_BTC_KLINES_TIMEOUT_SECONDS",
 # the live orderbook midpoint instead.
 CLOB_API = os.getenv("PAPER_POLYMARKET_CLOB_API", "https://clob.polymarket.com")
 CLOB_TIMEOUT_SECONDS = float(os.getenv("PAPER_CLOB_TIMEOUT_SECONDS", "5"))
+# Daily-temperature events tag: these markets rarely reach the volume-ordered
+# top pages (~10 visible vs ~1100 active), so the weather strategy fetches
+# them by tag instead of relying on the general volume-sorted universe.
+WEATHER_TAG_ID = os.getenv("PAPER_WEATHER_TAG_ID", "103040")
 
 # BTC 5m Endgame (last-minute dedicated)
 ENDGAME_ENABLED = os.getenv("PAPER_ENDGAME_ENABLED", "1") == "1"
@@ -424,7 +428,7 @@ def _parse_weather_metric(text: str) -> Optional[Dict[str, Any]]:
     if not any(k in lower for k in ["temperature", "temp", "degrees", "°", "fahrenheit", "celsius"]):
         return None
 
-    temp_kind = "min" if re.search(r"\b(low|min|minimum)\b", lower) else "max"
+    temp_kind = "min" if re.search(r"\b(low|lowest|min|minimum)\b", lower) else "max"
 
     def _band_spec(low: float | None, high: float | None, unit_raw: str) -> dict[str, Any]:
         # Official readings are integers, so a bucket like "27°C" resolves YES
@@ -731,6 +735,29 @@ async def fetch_gamma_events(limit: int = 100, pages: int = 3) -> List[Dict[str,
         f"{GAMMA_API}/events", limit, pages,
         {"active": "true", "closed": "false"},
     )
+
+
+async def fetch_weather_markets(limit: int = 100) -> list[GammaMarket]:
+    """Fetch daily-temperature markets by tag (volume ordering hides them)."""
+    markets: list[GammaMarket] = []
+    try:
+        async with httpx.AsyncClient(timeout=GAMMA_TIMEOUT_SECONDS, trust_env=True) as client:
+            resp = await client.get(
+                f"{GAMMA_API}/events",
+                params={"tag_id": WEATHER_TAG_ID, "active": "true", "closed": "false", "limit": limit},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        if isinstance(data, list):
+            for event in data:
+                for raw in event.get("markets") or []:
+                    m = _parse_market(raw)
+                    if m and m.active and not m.closed:
+                        markets.append(m)
+    except Exception as e:
+        logger.warning("Weather markets fetch failed: %s", e)
+    logger.info("Fetched %d daily-temperature weather markets", len(markets))
+    return markets
 
 # ---------------------------------------------------------------------------
 # Strategy 1: Arbitrage — mutually exclusive markets summing > 100%
@@ -2060,14 +2087,20 @@ async def scan_all() -> Dict[str, Any]:
             logger.error("Failed to fetch %s: %s", name, e)
             return []
 
-    markets, events, btc_5m_events = await asyncio.gather(
+    markets, events, btc_5m_events, weather_markets = await asyncio.gather(
         _fetch_or_empty("Gamma markets", fetch_gamma_markets),
         _fetch_or_empty("Gamma events", fetch_gamma_events),
         _fetch_or_empty("BTC 5m events", fetch_btc_5m_events),
+        _fetch_or_empty("Weather markets", fetch_weather_markets),
     )
 
     total_markets = len(markets)
     logger.info("Fetched %d markets, %d events", total_markets, len(events))
+
+    # Weather-only universe: the general list plus tag-fetched temperature
+    # markets (deduped). Other strategies keep the volume-sorted universe.
+    general_ids = {m.market_id for m in markets}
+    weather_universe = markets + [m for m in weather_markets if m.market_id not in general_ids]
 
     # Run strategies (each wrapped in try/except)
     all_signals: List[Signal] = []
@@ -2081,7 +2114,7 @@ async def scan_all() -> Dict[str, Any]:
         ("Smart Money", lambda: detect_smart_money(markets)),
         ("Smart Money Copy", lambda: detect_smart_money_copy(markets)),
         ("Event Countdown", lambda: detect_event_countdown(markets)),
-        ("Weather Forecast", lambda: detect_weather_forecast(markets)),
+        ("Weather Forecast", lambda: detect_weather_forecast(weather_universe)),
     ]
     for name, fn in strategy_funcs:
         try:
