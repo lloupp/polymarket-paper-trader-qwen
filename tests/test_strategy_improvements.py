@@ -13,6 +13,8 @@ from scanner import (
     _parse_clob_token_ids,
     _parse_weather_metric,
     _trader_quality_score,
+    _weather_cache_get,
+    _weather_cache_put,
     _weather_probability_from_ensemble,
     _with_live_prices,
     detect_smart_money,
@@ -217,6 +219,26 @@ class WeatherBandParsingTest(unittest.TestCase):
         yes_prob, _, note = result
         self.assertAlmostEqual(yes_prob, 0.5)
         self.assertIn("band=[26.5,27.5)", note)
+
+
+class WeatherCacheTest(unittest.TestCase):
+    def test_fresh_entry_is_returned(self):
+        cache = {}
+        _weather_cache_put(cache, "ens:miami:fahrenheit", {"hourly": {}}, now_ts=1000.0)
+        self.assertEqual(
+            _weather_cache_get(cache, "ens:miami:fahrenheit", ttl_seconds=1800, now_ts=1000.0 + 1799),
+            {"hourly": {}},
+        )
+
+    def test_expired_entry_is_none(self):
+        cache = {}
+        _weather_cache_put(cache, "k", {"x": 1}, now_ts=1000.0)
+        self.assertIsNone(_weather_cache_get(cache, "k", ttl_seconds=1800, now_ts=1000.0 + 1800))
+
+    def test_missing_or_malformed_entry_is_none(self):
+        self.assertIsNone(_weather_cache_get({}, "k", 1800, 0.0))
+        self.assertIsNone(_weather_cache_get({"k": "not-a-dict"}, "k", 1800, 0.0))
+        self.assertIsNone(_weather_cache_get({"k": {"payload": 1}}, "k", 1800, 0.0))
 
 
 class StrategyRotationTest(unittest.TestCase):

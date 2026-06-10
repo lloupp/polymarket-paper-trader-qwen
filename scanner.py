@@ -102,6 +102,13 @@ WEATHER_TIMEOUT_SECONDS = float(os.getenv("PAPER_WEATHER_TIMEOUT_SECONDS", "8"))
 WEATHER_GEOCODE_API = os.getenv("PAPER_WEATHER_GEOCODE_API", "https://geocoding-api.open-meteo.com/v1/search")
 WEATHER_FORECAST_API = os.getenv("PAPER_WEATHER_FORECAST_API", "https://api.open-meteo.com/v1/forecast")
 WEATHER_ENSEMBLE_API = os.getenv("PAPER_WEATHER_ENSEMBLE_API", "https://ensemble-api.open-meteo.com/v1/ensemble")
+# Cross-cycle disk cache: each cycle runs as a fresh settlement.py subprocess,
+# so in-memory caches die with it and every cycle re-fetched ~30 geocodes +
+# ensembles (the bulk of cycle latency). Ensemble forecasts change on model-run
+# cadence (hours), not per-minute, so a 30-min TTL loses nothing.
+WEATHER_CACHE_FILE = os.getenv("PAPER_WEATHER_CACHE_FILE", "logs/weather_ensemble_cache.json")
+WEATHER_ENSEMBLE_CACHE_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_ENSEMBLE_CACHE_TTL", "1800"))
+WEATHER_GEOCODE_CACHE_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_GEOCODE_CACHE_TTL", "604800"))
 
 # Mean Reversion
 MEAN_REVERSION_THRESHOLD = 0.10   # 10% weekly move (primary)
@@ -1524,6 +1531,41 @@ async def detect_event_countdown(markets: List[GammaMarket]) -> List[Signal]:
 # Strategy 7: Weather forecast (shadow-first)
 # ---------------------------------------------------------------------------
 
+def _load_weather_cache() -> dict[str, Any]:
+    try:
+        with open(WEATHER_CACHE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_weather_cache(cache: dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(WEATHER_CACHE_FILE) or ".", exist_ok=True)
+        tmp = WEATHER_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False)
+        os.replace(tmp, WEATHER_CACHE_FILE)
+    except Exception as e:
+        logger.debug("Weather cache save failed: %s", e)
+
+
+def _weather_cache_get(cache: dict[str, Any], key: str, ttl_seconds: float, now_ts: float) -> Any | None:
+    """Return the cached payload if the entry exists and is younger than ttl."""
+    entry = cache.get(key)
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = entry.get("ts")
+    if not isinstance(fetched_at, (int, float)) or now_ts - fetched_at >= ttl_seconds:
+        return None
+    return entry.get("payload")
+
+
+def _weather_cache_put(cache: dict[str, Any], key: str, payload: Any, now_ts: float) -> None:
+    cache[key] = {"ts": now_ts, "payload": payload}
+
+
 async def _weather_geocode(client: httpx.AsyncClient, location: str) -> Optional[Dict[str, Any]]:
     try:
         resp = await client.get(
@@ -1604,9 +1646,12 @@ async def detect_weather_forecast(
         return signals
 
     now = now or datetime.now(timezone.utc)
+    now_ts = now.timestamp()
     geocode_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     forecast_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
     ensemble_cache: Dict[Tuple[str, str], Optional[Dict[str, Any]]] = {}
+    disk_cache = _load_weather_cache()
+    cache_dirty = False
 
     async with httpx.AsyncClient(timeout=WEATHER_TIMEOUT_SECONDS, trust_env=False) as client:
         for m in markets:
@@ -1636,10 +1681,15 @@ async def detect_weather_forecast(
                 if days_ahead < 0 or days_ahead >= WEATHER_MAX_DAYS_AHEAD:
                     continue
 
-                geo = geocode_cache.get(location)
                 if location not in geocode_cache:
-                    geo = await _weather_geocode(client, location)
+                    geo = _weather_cache_get(disk_cache, f"geo:{location}", WEATHER_GEOCODE_CACHE_TTL_SECONDS, now_ts)
+                    if geo is None:
+                        geo = await _weather_geocode(client, location)
+                        if geo:
+                            _weather_cache_put(disk_cache, f"geo:{location}", geo, now_ts)
+                            cache_dirty = True
                     geocode_cache[location] = geo
+                geo = geocode_cache.get(location)
                 if not geo:
                     continue
 
@@ -1648,10 +1698,16 @@ async def detect_weather_forecast(
 
                 # Prefer the 31-member GFS ensemble: probability comes from counting
                 # how many members cross the market's threshold, not a heuristic curve.
-                ensemble = ensemble_cache.get(cache_key)
                 if cache_key not in ensemble_cache:
-                    ensemble = await _weather_ensemble_forecast(client, geo, unit)
+                    disk_key = f"ens:{location}:{unit}"
+                    ensemble = _weather_cache_get(disk_cache, disk_key, WEATHER_ENSEMBLE_CACHE_TTL_SECONDS, now_ts)
+                    if ensemble is None:
+                        ensemble = await _weather_ensemble_forecast(client, geo, unit)
+                        if ensemble:
+                            _weather_cache_put(disk_cache, disk_key, ensemble, now_ts)
+                            cache_dirty = True
                     ensemble_cache[cache_key] = ensemble
+                ensemble = ensemble_cache.get(cache_key)
                 probability = _weather_probability_from_ensemble(spec, ensemble, date_iso) if ensemble else None
                 forecast_source = "gfs_ensemble"
 
@@ -1712,6 +1768,15 @@ async def detect_weather_forecast(
                 ))
             except Exception as e:
                 logger.debug("Weather forecast detection failed for market %s: %s", m.market_id, e)
+
+    if cache_dirty:
+        # Prune expired entries so the cache file stays bounded.
+        for key in list(disk_cache):
+            ttl = WEATHER_GEOCODE_CACHE_TTL_SECONDS if key.startswith("geo:") else WEATHER_ENSEMBLE_CACHE_TTL_SECONDS
+            entry = disk_cache.get(key)
+            if not isinstance(entry, dict) or now_ts - float(entry.get("ts", 0) or 0) >= ttl:
+                disk_cache.pop(key, None)
+        _save_weather_cache(disk_cache)
 
     signals.sort(key=lambda s: s.confidence * abs(s.edge), reverse=True)
     logger.info("Weather Forecast: %d signals found", len(signals))
