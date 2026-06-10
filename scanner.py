@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,6 +73,11 @@ BTC_5M_HIGH_PRICE_PENALTY_START = float(os.getenv("PAPER_BTC_5M_HIGH_PRICE_PENAL
 BTC_5M_HIGH_PRICE_MAX_PENALTY = float(os.getenv("PAPER_BTC_5M_HIGH_PRICE_MAX_PENALTY", "0.045"))
 BTC_KLINES_API = os.getenv("PAPER_BTC_KLINES_API", "https://api.binance.com/api/v3/klines")
 BTC_KLINES_TIMEOUT_SECONDS = float(os.getenv("PAPER_BTC_KLINES_TIMEOUT_SECONDS", "5"))
+# CLOB midpoint: Gamma outcomePrices lag badly on 5-minute markets (observed
+# 0.855 vs 0.985 real at the same instant), so fast strategies must price off
+# the live orderbook midpoint instead.
+CLOB_API = os.getenv("PAPER_POLYMARKET_CLOB_API", "https://clob.polymarket.com")
+CLOB_TIMEOUT_SECONDS = float(os.getenv("PAPER_CLOB_TIMEOUT_SECONDS", "5"))
 
 # BTC 5m Endgame (last-minute dedicated)
 ENDGAME_ENABLED = os.getenv("PAPER_ENDGAME_ENABLED", "1") == "1"
@@ -188,6 +193,7 @@ class GammaMarket:
     price_change_7d: float = 0.0
     price_change_1d: float = 0.0
     end_date: Optional[datetime] = None
+    game_start_time: datetime | None = None
     active: bool = True
     closed: bool = False
     group_item_title: str = ""
@@ -576,6 +582,18 @@ def _parse_market(m: dict) -> Optional[GammaMarket]:
         except (ValueError, AttributeError):
             pass
 
+    # Game start time (sports markets only; absent for non-sports markets).
+    # Used to detect live/in-play games where 24h price momentum is stale.
+    game_start_time = None
+    game_start_str = m.get("gameStartTime") or m.get("eventStartTime") or ""
+    if game_start_str:
+        try:
+            game_start_time = datetime.fromisoformat(str(game_start_str).replace("Z", "+00:00"))
+            if game_start_time.tzinfo is None:
+                game_start_time = game_start_time.replace(tzinfo=timezone.utc)
+        except (ValueError, AttributeError):
+            pass
+
     return GammaMarket(
         market_id=mid,
         event_id=str(m.get("conditionId", "") or m.get("event_id", "")),
@@ -593,6 +611,7 @@ def _parse_market(m: dict) -> Optional[GammaMarket]:
         price_change_7d=float(m.get("oneWeekPriceChange", 0) or m.get("priceChange7d", 0) or 0),
         price_change_1d=float(m.get("oneDayPriceChange", 0) or m.get("priceChange24hr", 0) or 0),
         end_date=end_date,
+        game_start_time=game_start_time,
         active=bool(m.get("active", True)),
         closed=bool(m.get("closed", False)),
         group_item_title=str(m.get("groupItemTitle", "") or ""),
@@ -1055,6 +1074,7 @@ async def detect_smart_money(markets: List[GammaMarket]) -> List[Signal]:
     """
     signals: List[Signal] = []
     cat_avg = category_avg_volumes(markets)
+    now = datetime.now(timezone.utc)
 
     for m in markets:
         try:
@@ -1065,6 +1085,10 @@ async def detect_smart_money(markets: List[GammaMarket]) -> List[Signal]:
             # Filter out multi-winner markets (World Cup, Eurovision, etc.)
             q_lower = m.question.lower()
             if any(kw in q_lower for kw in ["win the", "world cup", "eurovision", "championship winner"]):
+                continue
+            # Filter out live/in-play sports markets: price_change_1d (24h momentum) is
+            # stale once the game starts — the live game state moves faster than the signal.
+            if m.game_start_time is not None and now >= m.game_start_time:
                 continue
             if m.volume_24hr < 50000:
                 continue
@@ -1652,6 +1676,47 @@ async def _fetch_btc_klines(client: httpx.AsyncClient, interval: str = "1m", lim
         return None
 
 
+def _parse_clob_token_ids(raw_market: dict[str, Any]) -> list[str]:
+    """Extract CLOB token ids from a raw Gamma market (JSON-encoded string or list)."""
+    tokens = raw_market.get("clobTokenIds")
+    if isinstance(tokens, str):
+        try:
+            tokens = json.loads(tokens)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(tokens, list):
+        return []
+    return [str(t) for t in tokens if t]
+
+
+async def _fetch_clob_yes_midpoint(client: httpx.AsyncClient, raw_market: dict[str, Any]) -> float | None:
+    """Live YES midpoint from the CLOB orderbook; None on any failure."""
+    tokens = _parse_clob_token_ids(raw_market)
+    if not tokens:
+        return None
+    try:
+        resp = await client.get(
+            f"{CLOB_API}/midpoint",
+            params={"token_id": tokens[0]},
+            timeout=CLOB_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        mid = float(resp.json().get("mid"))
+    except Exception as e:
+        logger.debug("CLOB midpoint fetch failed: %s", e)
+        return None
+    if not (0.0 < mid < 1.0):
+        return None
+    return mid
+
+
+def _with_live_prices(m: GammaMarket, mid: float | None) -> GammaMarket:
+    """Return a copy of the market repriced at the live CLOB midpoint (no-op if mid is None)."""
+    if mid is None:
+        return m
+    return replace(m, yes_price=round(mid, 6), no_price=round(1.0 - mid, 6))
+
+
 def _compute_rsi(closes: List[float], period: int = 14) -> Optional[float]:
     """Classic Wilder RSI over the given close series."""
     if len(closes) < period + 1:
@@ -1739,6 +1804,10 @@ async def detect_btc_5m_momentum(events: Optional[List[Dict[str, Any]]] = None) 
                 continue
             if m.liquidity < BTC_5M_MIN_LIQUIDITY:
                 continue
+            # Reprice off the live CLOB midpoint: Gamma prices lag these 5m
+            # markets by enough to invalidate every gate below.
+            async with httpx.AsyncClient(trust_env=True) as clob_client:
+                m = _with_live_prices(m, await _fetch_clob_yes_midpoint(clob_client, raw_market))
             directional_edge = abs(m.yes_price - 0.5)
             if directional_edge < BTC_5M_MIN_DIRECTIONAL_EDGE:
                 continue
@@ -1853,6 +1922,10 @@ async def detect_endgame_last_minute(events: Optional[List[Dict[str, Any]]] = No
             if m.liquidity < ENDGAME_MIN_LIQUIDITY:
                 continue
 
+            # Last-minute entries are hypersensitive to price staleness: reprice
+            # off the live CLOB midpoint before any directional decision.
+            async with httpx.AsyncClient(trust_env=True) as clob_client:
+                m = _with_live_prices(m, await _fetch_clob_yes_midpoint(clob_client, markets[0]))
             directional_edge = abs(m.yes_price - 0.5)
             if directional_edge < ENDGAME_MIN_DIRECTIONAL_EDGE:
                 continue

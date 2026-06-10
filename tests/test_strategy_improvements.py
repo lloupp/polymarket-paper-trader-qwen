@@ -1,15 +1,20 @@
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scanner import (
+    GammaMarket,
     _compute_momentum,
     _compute_rsi,
+    _parse_clob_token_ids,
     _trader_quality_score,
     _weather_probability_from_ensemble,
+    _with_live_prices,
+    detect_smart_money,
 )
 from settlement import _streak_size_multiplier
 from wallet import DEFAULT_SETTINGS
@@ -131,6 +136,67 @@ class TraderQualityScoreTest(unittest.TestCase):
     def test_rejects_too_few_samples(self):
         positions = [{"active": False, "redeemable": True, "cashPnl": 10}]
         self.assertIsNone(_trader_quality_score(positions, []))
+
+
+def _smart_money_market(market_id, game_start_time, *, price_change_1d=0.05):
+    return GammaMarket(
+        market_id=market_id,
+        event_slug=f"market-{market_id}",
+        question="Will the home team win?",
+        yes_price=0.5,
+        no_price=0.5,
+        spread=0.01,
+        volume_24hr=200000,
+        liquidity=50000,
+        price_change_1d=price_change_1d,
+        game_start_time=game_start_time,
+    )
+
+
+class SmartMoneyLiveGameFilterTest(unittest.IsolatedAsyncioTestCase):
+    async def test_excludes_market_whose_game_already_started(self):
+        now = datetime.now(timezone.utc)
+        live = _smart_money_market("live", now - timedelta(minutes=30))
+        signals = await detect_smart_money([live])
+        self.assertFalse(any(s.market_id == "live" for s in signals))
+
+    async def test_keeps_pregame_sports_market(self):
+        now = datetime.now(timezone.utc)
+        pregame = _smart_money_market("pregame", now + timedelta(hours=2))
+        signals = await detect_smart_money([pregame])
+        self.assertTrue(any(s.market_id == "pregame" for s in signals))
+
+    async def test_keeps_non_sports_market_without_game_start_time(self):
+        non_sports = _smart_money_market("nonsports", None)
+        signals = await detect_smart_money([non_sports])
+        self.assertTrue(any(s.market_id == "nonsports" for s in signals))
+
+
+class ClobLivePriceTest(unittest.TestCase):
+    def test_parses_json_encoded_token_ids(self):
+        raw = {"clobTokenIds": '["111", "222"]'}
+        self.assertEqual(_parse_clob_token_ids(raw), ["111", "222"])
+
+    def test_parses_list_token_ids(self):
+        raw = {"clobTokenIds": [111, 222]}
+        self.assertEqual(_parse_clob_token_ids(raw), ["111", "222"])
+
+    def test_returns_empty_on_missing_or_malformed(self):
+        self.assertEqual(_parse_clob_token_ids({}), [])
+        self.assertEqual(_parse_clob_token_ids({"clobTokenIds": "not-json"}), [])
+        self.assertEqual(_parse_clob_token_ids({"clobTokenIds": 42}), [])
+
+    def test_with_live_prices_reprices_both_sides(self):
+        m = _smart_money_market("m1", None)
+        live = _with_live_prices(m, 0.85)
+        self.assertAlmostEqual(live.yes_price, 0.85)
+        self.assertAlmostEqual(live.no_price, 0.15)
+        # original untouched (dataclasses.replace returns a copy)
+        self.assertAlmostEqual(m.yes_price, 0.5)
+
+    def test_with_live_prices_none_is_noop(self):
+        m = _smart_money_market("m1", None)
+        self.assertIs(_with_live_prices(m, None), m)
 
 
 if __name__ == "__main__":
