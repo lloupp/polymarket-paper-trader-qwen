@@ -111,33 +111,24 @@ class StreakSizeMultiplierTest(unittest.TestCase):
 
 
 class TraderQualityScoreTest(unittest.TestCase):
+    # _trader_quality_score consome entradas de /closed-positions (realizedPnl).
     def test_qualifies_trader_with_strong_track_record(self):
-        positions = [
-            {"active": False, "redeemable": True, "cashPnl": pnl}
-            for pnl in [50, 40, 30, 20, -10, 60, -5]
-        ]
+        positions = [{"realizedPnl": pnl} for pnl in [50, 40, 30, 20, -10, 60, -5]]
         quality = _trader_quality_score(positions, [])
         self.assertIsNotNone(quality)
         self.assertGreaterEqual(quality["win_rate"], 0.6)
         self.assertGreaterEqual(quality["profit_factor"], 1.5)
 
     def test_rejects_low_win_rate(self):
-        positions = [
-            {"active": False, "redeemable": True, "cashPnl": pnl}
-            for pnl in [10, -10, -10, -10, 10]
-        ]
+        positions = [{"realizedPnl": pnl} for pnl in [10, -10, -10, -10, 10]]
         self.assertIsNone(_trader_quality_score(positions, []))
 
     def test_rejects_concentrated_pnl(self):
-        positions = [
-            {"active": False, "redeemable": True, "cashPnl": pnl}
-            for pnl in [500, 5, 5, 5, 5, 5]
-        ]
+        positions = [{"realizedPnl": pnl} for pnl in [500, 5, 5, 5, 5, 5]]
         self.assertIsNone(_trader_quality_score(positions, []))
 
     def test_rejects_too_few_samples(self):
-        positions = [{"active": False, "redeemable": True, "cashPnl": 10}]
-        self.assertIsNone(_trader_quality_score(positions, []))
+        self.assertIsNone(_trader_quality_score([{"realizedPnl": 10}], []))
 
 
 def _smart_money_market(market_id, game_start_time, *, price_change_1d=0.05):

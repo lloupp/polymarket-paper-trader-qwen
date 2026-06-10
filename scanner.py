@@ -1268,6 +1268,26 @@ async def _fetch_trader_positions(client: httpx.AsyncClient, wallet_address: str
         return []
 
 
+async def _fetch_trader_closed_positions(client: httpx.AsyncClient, wallet_address: str) -> list[dict[str, Any]]:
+    """Most recent resolved positions (realizedPnl per market) for quality scoring.
+
+    /positions only returns OPEN positions (realizedPnl=0, no `active` field), so
+    win-rate/profit-factor must come from /closed-positions, sorted by recency to
+    avoid the PnL-sorted top-N inflating the win rate.
+    """
+    try:
+        resp = await client.get(
+            f"{DATA_API}/closed-positions",
+            params={"user": wallet_address, "sortBy": "TIMESTAMP", "sortDirection": "DESC", "limit": 200},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.debug("Smart money copy: closed positions fetch failed for %s: %s", wallet_address, e)
+        return []
+
+
 async def _fetch_trader_trades(client: httpx.AsyncClient, wallet_address: str) -> List[Dict[str, Any]]:
     try:
         resp = await client.get(f"{DATA_API}/trades", params={"user": wallet_address, "limit": 100})
@@ -1279,14 +1299,14 @@ async def _fetch_trader_trades(client: httpx.AsyncClient, wallet_address: str) -
         return []
 
 
-def _trader_quality_score(positions: List[Dict[str, Any]], trades: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+def _trader_quality_score(closed_positions: List[Dict[str, Any]], trades: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
     """Replicate MrFadiAi/Polymarket-bot's smart-money filters: WR >= 60%, profit
     factor >= 1.5, and no single closed position concentrating > 30% of total PnL.
 
+    Expects /closed-positions entries (realizedPnl per resolved market).
     Returns a quality dict if the wallet passes all filters, else None.
     """
-    closed = [p for p in positions if bool(p.get("redeemable", False)) or not bool(p.get("active", True))]
-    pnls = [float(p.get("cashPnl", p.get("realizedPnl", 0.0)) or 0.0) for p in closed]
+    pnls = [float(p.get("realizedPnl", p.get("cashPnl", 0.0)) or 0.0) for p in closed_positions]
     pnls = [p for p in pnls if p != 0.0]
     if len(pnls) < 5:
         return None
@@ -1336,15 +1356,17 @@ async def detect_smart_money_copy(markets: List[GammaMarket]) -> List[Signal]:
     async with httpx.AsyncClient(timeout=SMART_MONEY_COPY_TIMEOUT_SECONDS, trust_env=True) as client:
         for wallet_address in SMART_MONEY_COPY_WALLETS:
             try:
-                positions, trades = await asyncio.gather(
+                positions, closed_positions = await asyncio.gather(
                     _fetch_trader_positions(client, wallet_address),
-                    _fetch_trader_trades(client, wallet_address),
+                    _fetch_trader_closed_positions(client, wallet_address),
                 )
-                quality = _trader_quality_score(positions, trades)
+                quality = _trader_quality_score(closed_positions, [])
                 if not quality:
                     continue
 
-                open_positions = [p for p in positions if bool(p.get("active", True)) and not bool(p.get("redeemable", False))]
+                # /positions only returns open positions; redeemable=True means
+                # already resolved (awaiting redemption), not copyable.
+                open_positions = [p for p in positions if not bool(p.get("redeemable", False))]
                 total_value = sum(abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0)) for p in open_positions) or 1.0
 
                 for p in open_positions:
