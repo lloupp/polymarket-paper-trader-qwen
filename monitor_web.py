@@ -633,8 +633,38 @@ class H(BaseHTTPRequestHandler):
             runtime_state = read_runtime_state()
             timeline_tail = read_timeline_tail(40)
             news_payload = fetch_google_news()
+            now_dt = datetime.now(timezone.utc)
+            paper_running = is_paper_loop_running()
+
+            # Idades calculadas no servidor (clock do browser pode divergir).
+            last_cycle_age = None
+            rt_ts = runtime_state.get('ts') if isinstance(runtime_state, dict) else None
+            if rt_ts:
+                try:
+                    last_cycle_age = max(0.0, (now_dt - datetime.fromisoformat(str(rt_ts))).total_seconds())
+                except ValueError:
+                    pass
+            log_age = None
+            if LOG.exists():
+                log_age = max(0.0, now_dt.timestamp() - LOG.stat().st_mtime)
+            scan_info = report_json.get('scan', {}) if isinstance(report_json, dict) else {}
+            exec_info = report_json.get('execution', {}) if isinstance(report_json, dict) else {}
+            executed_raw = exec_info.get('executed', 0)
+            executed_count = len(executed_raw) if isinstance(executed_raw, list) else int(executed_raw or 0)
+            activity = {
+                'running': paper_running,
+                'last_cycle_age_seconds': last_cycle_age,
+                'log_age_seconds': log_age,
+                'loop_interval_seconds': read_loop_seconds(90),
+                'last_cycle_summary': {
+                    'markets': int(scan_info.get('total_markets', 0) or 0),
+                    'signals': int(scan_info.get('total_signals', 0) or 0),
+                    'actionable': int(scan_info.get('actionable_signals', 0) or 0),
+                    'executed': executed_count,
+                },
+            }
             payload = {
-                'now': datetime.now(timezone.utc).isoformat(),
+                'now': now_dt.isoformat(),
                 'wallet': wallet,
                 'settings_controls': wallet_controls_from_state(wallet),
                 'learning_controls': learning_controls_from_state(wallet),
@@ -646,8 +676,9 @@ class H(BaseHTTPRequestHandler):
                 'strategies': current_strategies(report, report_json),
                 'controls': {
                     'loop_interval_seconds': read_loop_seconds(90),
-                    'paper_loop_running': is_paper_loop_running(),
+                    'paper_loop_running': paper_running,
                 },
+                'activity': activity,
                 'runtime_state': runtime_state,
                 'timeline_tail': timeline_tail,
                 'news': news_payload.get('items', []),
@@ -705,10 +736,60 @@ details.card[open] summary:after{content:'fechar'}
 pre{white-space:pre-wrap;word-break:break-word;background:#070d1a;border:1px solid var(--line);border-radius:10px;padding:10px;max-height:34vh;overflow:auto;font-size:12px}
 canvas{width:100%;height:190px;background:#070d1a;border:1px solid var(--line);border-radius:10px}.muted{color:var(--muted)}
 @media (max-width:960px){.grid{grid-template-columns:1fr 1fr}.columns,.columns-2{grid-template-columns:1fr}.fieldgrid{grid-template-columns:1fr 1fr}.field.wide{grid-column:span 1}} @media (max-width:560px){.grid,.fieldgrid{grid-template-columns:1fr}.wrap{padding:8px}.h1{font-size:19px}}
+/* --- indicador de atividade --- */
+.act-dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;background:#64748b;vertical-align:middle}
+.act-dot.good{background:var(--good);animation:actpulse 1.4s ease-in-out infinite}
+.act-dot.warn{background:var(--warn)}.act-dot.bad{background:var(--bad)}
+@keyframes actpulse{0%,100%{box-shadow:0 0 0 0 rgba(34,197,94,.55)}50%{box-shadow:0 0 0 6px rgba(34,197,94,0)}}
+/* --- pista do robô (RPG) --- */
+.bot-track-card{margin-top:8px;padding:6px 14px 4px}
+.bot-track{position:relative;height:50px;border-bottom:2px dashed var(--line)}
+.bot-flag{position:absolute;right:2px;bottom:3px;font-size:15px}
+.bot-sprite{position:absolute;left:2%;bottom:3px;width:36px;height:39px;transition:left 1s linear}
+.bot-sprite .lay{position:absolute;top:0;left:0;width:3px;height:3px;background:transparent}
+/* corpo do robô em pixel art via box-shadow (1 "pixel" = 3px) */
+.bot-sprite .body{box-shadow:
+ 18px 0 0 0 #f59e0b,18px 3px 0 0 #94a3b8,
+ 9px 6px 0 0 #7dd3fc,12px 6px 0 0 #7dd3fc,15px 6px 0 0 #7dd3fc,18px 6px 0 0 #7dd3fc,21px 6px 0 0 #7dd3fc,24px 6px 0 0 #7dd3fc,27px 6px 0 0 #7dd3fc,
+ 9px 9px 0 0 #7dd3fc,12px 9px 0 0 #7dd3fc,15px 9px 0 0 #7dd3fc,18px 9px 0 0 #7dd3fc,21px 9px 0 0 #7dd3fc,24px 9px 0 0 #7dd3fc,27px 9px 0 0 #7dd3fc,
+ 9px 12px 0 0 #7dd3fc,12px 12px 0 0 #7dd3fc,15px 12px 0 0 #0b1220,18px 12px 0 0 #7dd3fc,21px 12px 0 0 #0b1220,24px 12px 0 0 #7dd3fc,27px 12px 0 0 #7dd3fc,
+ 9px 15px 0 0 #7dd3fc,12px 15px 0 0 #7dd3fc,15px 15px 0 0 #7dd3fc,18px 15px 0 0 #7dd3fc,21px 15px 0 0 #7dd3fc,24px 15px 0 0 #7dd3fc,27px 15px 0 0 #7dd3fc,
+ 12px 18px 0 0 #0ea5e9,15px 18px 0 0 #0ea5e9,18px 18px 0 0 #0ea5e9,21px 18px 0 0 #0ea5e9,24px 18px 0 0 #0ea5e9,
+ 12px 21px 0 0 #0ea5e9,15px 21px 0 0 #0ea5e9,18px 21px 0 0 #7dd3fc,21px 21px 0 0 #0ea5e9,24px 21px 0 0 #0ea5e9,
+ 12px 24px 0 0 #0ea5e9,15px 24px 0 0 #0ea5e9,18px 24px 0 0 #0ea5e9,21px 24px 0 0 #0ea5e9,24px 24px 0 0 #0ea5e9,
+ 12px 27px 0 0 #0ea5e9,15px 27px 0 0 #0ea5e9,18px 27px 0 0 #0ea5e9,21px 27px 0 0 #0ea5e9,24px 27px 0 0 #0ea5e9,
+ 9px 18px 0 0 #94a3b8,9px 21px 0 0 #94a3b8,27px 18px 0 0 #94a3b8,27px 21px 0 0 #94a3b8}
+/* pernas: frame 1 (juntas) e frame 2 (passada) */
+.bot-sprite .f1{box-shadow:15px 30px 0 0 #94a3b8,21px 30px 0 0 #94a3b8,15px 33px 0 0 #94a3b8,21px 33px 0 0 #94a3b8,12px 36px 0 0 #64748b,15px 36px 0 0 #64748b,21px 36px 0 0 #64748b,24px 36px 0 0 #64748b}
+.bot-sprite .f2{box-shadow:12px 30px 0 0 #94a3b8,24px 30px 0 0 #94a3b8,9px 33px 0 0 #94a3b8,24px 33px 0 0 #94a3b8,6px 36px 0 0 #64748b,9px 36px 0 0 #64748b,24px 36px 0 0 #64748b,27px 36px 0 0 #64748b;opacity:0}
+.bot-sprite.walking{animation:botbob .6s steps(2) infinite}
+.bot-sprite.walking .f1{animation:legA .5s steps(1) infinite}
+.bot-sprite.walking .f2{animation:legB .5s steps(1) infinite}
+@keyframes botbob{0%,100%{transform:translateY(0)}50%{transform:translateY(-2px)}}
+@keyframes legA{0%,49%{opacity:1}50%,100%{opacity:0}}
+@keyframes legB{0%,49%{opacity:0}50%,100%{opacity:1}}
+.bot-sprite.sleeping{filter:grayscale(1) brightness(.65)}
+.bot-sprite.celebrating{animation:botjump .45s ease-in-out infinite}
+@keyframes botjump{0%,100%{transform:translateY(0)}50%{transform:translateY(-11px)}}
+.bot-bubble{position:absolute;top:-15px;left:28px;font-size:11px;color:var(--muted);white-space:nowrap}
+.bot-sprite.sleeping .bot-bubble{animation:zfloat 2s ease-in-out infinite}
+@keyframes zfloat{0%,100%{transform:translateY(0);opacity:.6}50%{transform:translateY(-4px);opacity:1}}
+.bot-coin{position:absolute;bottom:30px;font-size:13px;opacity:0;pointer-events:none}
+.bot-sprite.celebrating ~ .bot-coin{animation:coinup 1s ease-out infinite}
+@keyframes coinup{0%{opacity:0;transform:translateY(8px)}25%{opacity:1}100%{opacity:0;transform:translateY(-18px)}}
+.bot-caption{font-size:11px;margin-top:4px}
 </style>
 </head>
 <body><div class='wrap'>
-<div class='top'><div class='h1'>Polymarket Paper Trader Dashboard</div><div class='badge' id='now'>atualizando...</div></div>
+<div class='top'><div class='h1'>Polymarket Paper Trader Dashboard</div><div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'><div class='badge' id='actBadge'><span class='act-dot' id='actDot'></span><span id='actText'>verificando...</span></div><div class='badge' id='now'>atualizando...</div></div></div>
+<div class='bot-track-card card'>
+  <div class='bot-track'>
+    <div class='bot-flag'>🚩</div>
+    <div class='bot-sprite' id='botSprite'><div class='lay body'></div><div class='lay f1'></div><div class='lay f2'></div><div class='bot-bubble' id='botBubble'></div></div>
+    <div class='bot-coin' id='botCoin'>🪙</div>
+  </div>
+  <div class='bot-caption muted' id='botCaption'>aguardando dados do bot...</div>
+</div>
 <div class='grid'>
   <div class='card'><div class='kpi-title'>Bankroll atual</div><div id='bankroll' class='kpi-value'>$0</div><div id='bankrollSub' class='kpi-sub'>vs inicial</div></div>
   <div class='card'><div class='kpi-title'>Lucro/Prejuízo (P&L)</div><div id='pnl' class='kpi-value'>$0</div><div id='pnlSub' class='kpi-sub'>paper trading</div></div>
@@ -1293,8 +1374,44 @@ async function load(){
     fillLearningForm(d.learning_controls || {});
     document.getElementById('report').textContent=d.last_report||'(sem relatório ainda)';
     document.getElementById('log').textContent=d.log_tail||'(sem logs ainda)';
+    if(d.activity){
+      act.running=!!d.activity.running;
+      act.logAge=Number.isFinite(Number(d.activity.log_age_seconds))?Number(d.activity.log_age_seconds):null;
+      act.cycleAge=Number.isFinite(Number(d.activity.last_cycle_age_seconds))?Number(d.activity.last_cycle_age_seconds):null;
+      act.interval=Math.max(15,Number(d.activity.loop_interval_seconds)||90);
+      act.summary=d.activity.last_cycle_summary||null;
+      updateActivity();
+    }
   }catch(e){ document.getElementById('now').textContent='Erro de atualização: '+e; }
 }
+
+// --- indicador "bot trabalhando" + robô RPG ---
+const act={running:false,logAge:null,cycleAge:null,interval:90,summary:null};
+function fmtAge(s){ if(s==null) return '-'; s=Math.floor(s); return s<60?s+'s':Math.floor(s/60)+'m'+String(s%60).padStart(2,'0')+'s'; }
+function updateActivity(){
+  const dot=document.getElementById('actDot'), txt=document.getElementById('actText');
+  const sprite=document.getElementById('botSprite'), bubble=document.getElementById('botBubble');
+  const coin=document.getElementById('botCoin'), cap=document.getElementById('botCaption');
+  if(!dot||!sprite) return;
+  const la=act.logAge, ca=act.cycleAge, itv=act.interval;
+  let state='stopped';
+  if(act.running && la!=null && la<2*itv) state='working';
+  else if(act.running && la!=null && la<4*itv) state='late';
+  dot.className='act-dot '+(state==='working'?'good':state==='late'?'warn':'bad');
+  txt.textContent=state==='working'?('Trabalhando · ciclo há '+fmtAge(ca)):state==='late'?('Atrasado · sem atividade há '+fmtAge(la)):'Parado';
+  const celebrating=state==='working' && act.summary && act.summary.executed>0 && ca!=null && ca<12;
+  sprite.className='bot-sprite '+(celebrating?'celebrating':state==='working'?'walking':state==='stopped'?'sleeping':'');
+  bubble.textContent=state==='stopped'?'zZz':state==='late'?'?':(celebrating?'trade!':'');
+  const frac=ca!=null?Math.min(1,ca/itv):0;
+  const pos=2+frac*86;
+  sprite.style.left=pos.toFixed(1)+'%';
+  coin.style.left=(pos+3).toFixed(1)+'%';
+  if(cap){
+    const s=act.summary;
+    cap.textContent=s?('último ciclo: '+s.markets+' mercados · '+s.signals+' sinais · '+s.actionable+' acionáveis · '+s.executed+' trades'+(state==='working'?' · próximo em ~'+fmtAge(Math.max(0,itv-(ca||0))):'')):'-';
+  }
+}
+setInterval(()=>{ if(act.logAge!=null)act.logAge+=1; if(act.cycleAge!=null)act.cycleAge+=1; updateActivity(); },1000);
 load(); setInterval(load,10000);
 </script>
 </body></html>"""
