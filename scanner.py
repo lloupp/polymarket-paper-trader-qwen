@@ -109,6 +109,12 @@ WEATHER_ENSEMBLE_API = os.getenv("PAPER_WEATHER_ENSEMBLE_API", "https://ensemble
 WEATHER_CACHE_FILE = os.getenv("PAPER_WEATHER_CACHE_FILE", "logs/weather_ensemble_cache.json")
 WEATHER_ENSEMBLE_CACHE_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_ENSEMBLE_CACHE_TTL", "1800"))
 WEATHER_GEOCODE_CACHE_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_GEOCODE_CACHE_TTL", "604800"))
+# Open-Meteo weighs request cost by forecast_days × variables: 16 days of
+# 31-member hourly ensemble × ~30 cities in a burst trips its per-minute 429.
+# 7 days covers nearly every liquid daily-temperature market; the fetch delay
+# spaces out the burst when the cache refreshes.
+WEATHER_ENSEMBLE_FORECAST_DAYS = int(os.getenv("PAPER_WEATHER_ENSEMBLE_FORECAST_DAYS", "7"))
+WEATHER_ENSEMBLE_FETCH_DELAY_SECONDS = float(os.getenv("PAPER_WEATHER_ENSEMBLE_FETCH_DELAY", "1.0"))
 
 # Mean Reversion
 MEAN_REVERSION_THRESHOLD = 0.10   # 10% weekly move (primary)
@@ -1621,7 +1627,7 @@ async def _weather_ensemble_forecast(client: httpx.AsyncClient, geo: Dict[str, A
                 "hourly": "temperature_2m,precipitation",
                 "temperature_unit": unit,
                 "timezone": "auto",
-                "forecast_days": WEATHER_MAX_DAYS_AHEAD,
+                "forecast_days": WEATHER_ENSEMBLE_FORECAST_DAYS,
                 "models": "gfs_seamless",
             },
         )
@@ -1706,6 +1712,9 @@ async def detect_weather_forecast(
                         if ensemble:
                             _weather_cache_put(disk_cache, disk_key, ensemble, now_ts)
                             cache_dirty = True
+                        # Space out real fetches: a burst of ~30 heavy ensemble
+                        # requests trips Open-Meteo's per-minute rate limit.
+                        await asyncio.sleep(WEATHER_ENSEMBLE_FETCH_DELAY_SECONDS)
                     ensemble_cache[cache_key] = ensemble
                 ensemble = ensemble_cache.get(cache_key)
                 probability = _weather_probability_from_ensemble(spec, ensemble, date_iso) if ensemble else None
