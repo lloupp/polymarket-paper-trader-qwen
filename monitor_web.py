@@ -55,7 +55,16 @@ def wallet_file_lock(exclusive: bool):
 def tail(path: Path, n=200):
     if not path.exists():
         return ''
-    lines = path.read_text(errors='ignore').splitlines()
+    # Read only the file tail — the runner log grows to tens of MB and this
+    # runs on every dashboard request.
+    size = path.stat().st_size
+    window = max(262144, n * 1024)
+    with path.open('rb') as fh:
+        fh.seek(max(0, size - window))
+        text = fh.read().decode('utf-8', errors='ignore')
+    lines = text.splitlines()
+    if size > window:
+        lines = lines[1:]
     return '\n'.join(lines[-n:])
 
 

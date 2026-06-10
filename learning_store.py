@@ -105,22 +105,45 @@ def append_event(event: Dict[str, Any], event_log: Path = DEFAULT_EVENT_LOG) -> 
         fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _parse_jsonl_lines(lines: Iterable[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            rows.append(obj)
+    return rows
+
+
 def read_jsonl(path: Path, limit: Optional[int] = None) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
-    rows: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8", errors="ignore") as fh:
-        for line in fh:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                rows.append(obj)
-    return rows[-limit:] if limit else rows
+    if not limit:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            return _parse_jsonl_lines(fh)
+
+    # With a limit, parse only the file tail: the event log grows unbounded
+    # (>1 GB) and a full parse per cycle costs gigabytes of RAM and most of
+    # the loop latency. Grow the byte window until it yields `limit` rows.
+    size = path.stat().st_size
+    window = max(4 * 1024 * 1024, limit * 2048)
+    while True:
+        start = max(0, size - window)
+        with path.open("rb") as fh:
+            fh.seek(start)
+            chunk = fh.read()
+        lines = chunk.decode("utf-8", errors="ignore").splitlines()
+        if start > 0:
+            lines = lines[1:]  # drop the (likely partial) first line
+        rows = _parse_jsonl_lines(lines)
+        if len(rows) >= limit or start == 0:
+            return rows[-limit:]
+        window *= 4
 
 
 def load_pending(path: Path = DEFAULT_PENDING_FILE) -> Dict[str, Any]:
