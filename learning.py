@@ -28,6 +28,7 @@ def default_learning_state() -> Dict[str, Any]:
             "reasons": ["boot"],
             "updated_at": None,
         },
+        "probability_tables": {},
         "last_updated_at": None,
     }
 
@@ -251,6 +252,73 @@ def build_policy_recommendations(ls: Dict[str, Any], wallet_settings: Dict[str, 
     return rec
 
 
+def _prob_decile(p: float) -> str:
+    return f"d{min(9, max(0, int(p * 10)))}"
+
+
+def build_probability_tables(
+    event_log_path: Any = None,
+    *,
+    limit: int = 80_000,
+    min_bucket_n: int = 30,
+) -> dict[str, Any]:
+    """Per-strategy calibration table: predicted side-probability decile -> realized win rate.
+
+    Built from counterfactual signal_outcome events whose observed side price is
+    extreme enough to proxy resolution (>=0.95 won / <=0.05 lost). Probabilities
+    are converted to the signal's own side so all strategies share one space.
+    """
+    from pathlib import Path
+
+    from learning_store import DEFAULT_EVENT_LOG, read_jsonl
+
+    path = Path(event_log_path) if event_log_path else DEFAULT_EVENT_LOG
+    agg: dict[str, dict[str, dict[str, int]]] = {}
+    for r in read_jsonl(path, limit=limit):
+        if r.get("event_type") != "signal_outcome":
+            continue
+        try:
+            side = float(r.get("observed_side_price"))
+        except (TypeError, ValueError):
+            continue
+        if not (side >= 0.95 or side <= 0.05):
+            continue
+        sig = r.get("original_signal") or r.get("observed_signal") or {}
+        strategy = str(sig.get("strategy") or "")
+        if not strategy:
+            continue
+        try:
+            mp = float(sig.get("model_probability"))
+        except (TypeError, ValueError):
+            continue
+        direction = str(sig.get("direction") or "yes").lower()
+        p_side = mp if direction == "yes" else 1.0 - mp
+        d = _prob_decile(p_side)
+        bucket = agg.setdefault(strategy, {}).setdefault(d, {"n": 0, "wins": 0})
+        bucket["n"] += 1
+        bucket["wins"] += 1 if side >= 0.95 else 0
+
+    tables: dict[str, Any] = {}
+    for strategy, deciles in agg.items():
+        tables[strategy] = {}
+        for d, b in deciles.items():
+            realized = (b["wins"] + 1) / (b["n"] + 2)  # Laplace smoothing
+            tables[strategy][d] = {
+                "n": b["n"],
+                "realized": round(realized, 4),
+                "reliable": b["n"] >= min_bucket_n,
+            }
+    return tables
+
+
+def calibrated_side_probability(tables: dict[str, Any], strategy: str, p_side: float) -> float | None:
+    """Realized win rate for this strategy/decile, or None when not reliable yet."""
+    bucket = (tables.get(strategy) or {}).get(_prob_decile(p_side)) or {}
+    if not bucket.get("reliable"):
+        return None
+    return float(bucket.get("realized"))
+
+
 def maybe_refresh_policy(ls: Dict[str, Any], wallet_settings: Dict[str, Any]) -> Dict[str, Any]:
     ls["cycle_counter"] = int(ls.get("cycle_counter") or 0) + 1
     cooldown = int(ls.get("cooldown_cycles") or 10)
@@ -265,6 +333,10 @@ def maybe_refresh_policy(ls: Dict[str, Any], wallet_settings: Dict[str, Any]) ->
 
     compute_learning_metrics(ls)
     rec = build_policy_recommendations(ls, wallet_settings)
+    try:
+        ls["probability_tables"] = build_probability_tables()
+    except Exception:
+        pass  # calibration is best-effort; never break the cycle
     ls["last_policy_cycle"] = int(ls.get("cycle_counter") or 0)
     return rec
 

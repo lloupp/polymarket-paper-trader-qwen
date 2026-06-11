@@ -25,7 +25,7 @@ from common import (
     install_polymarket_dns_fallback,
     yes_no_from_gamma_market,
 )
-from learning import ensure_learning_state, learning_snapshot, maybe_refresh_policy
+from learning import calibrated_side_probability, ensure_learning_state, learning_snapshot, maybe_refresh_policy
 from learning_store import (
     new_cycle_id,
     observe_signal_outcomes_from_signals,
@@ -689,6 +689,7 @@ async def _filter_and_rank_signals(
     effective_min_edge: float,
     strategy_multipliers: Dict[str, float],
     execution_policy: Dict[str, Any],
+    probability_tables: dict[str, Any] | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Filter signals by strategy/edge, enrich with OSINT, apply policy filters, rank."""
     signals = [s for s in all_signals if s.get("strategy") in selected]
@@ -696,10 +697,47 @@ async def _filter_and_rank_signals(
     # OSINT enrichment skipped for pure BTC 5m scalps (news irrelevant on 5-min horizon)
     if not btc_only:
         actionable = await apply_osint_google_news(actionable)
+
+    # Calibration gate: when the strategy's outcome history says this decile of
+    # predicted side-probability realizes BELOW the entry price, the trade has
+    # negative expected value regardless of the strategy's own edge math.
+    # Deciles without enough samples pass through untouched (conservative).
+    calibration_rejected: list[dict[str, Any]] = []
+    if probability_tables:
+        kept: list[dict[str, Any]] = []
+        for s in actionable:
+            strategy = str(s.get("strategy") or "")
+            direction = str(s.get("direction") or "yes").lower()
+            try:
+                mp = float(s.get("model_probability"))
+                yes_price = float(s.get("market_probability"))
+            except (TypeError, ValueError):
+                kept.append(s)
+                continue
+            p_side = mp if direction == "yes" else 1.0 - mp
+            realized = calibrated_side_probability(probability_tables, strategy, p_side)
+            if realized is None:
+                kept.append(s)
+                continue
+            side_price = yes_price if direction == "yes" else 1.0 - yes_price
+            s["calibrated_side_prob"] = round(realized, 4)
+            s["calibrated_edge"] = round(realized - side_price, 4)
+            if s["calibrated_edge"] < 0:
+                calibration_rejected.append({
+                    "market_slug": s.get("event_slug", ""),
+                    "strategy": strategy,
+                    "reason": "calibration_negative_edge",
+                })
+                continue
+            kept.append(s)
+        actionable = kept
+
     actionable, policy_rejected = apply_execution_filters(actionable, execution_policy)
+    policy_rejected.extend(calibration_rejected)
     for s in actionable:
         mult = float(strategy_multipliers.get(str(s.get("strategy") or ""), 1.0) or 1.0)
-        s["_learn_score"] = float(s.get("net_edge", s.get("edge", 0)) or 0) * mult
+        base_edge = s.get("calibrated_edge", s.get("net_edge", s.get("edge", 0)))
+        s["_learn_score"] = float(base_edge or 0) * mult
     actionable.sort(key=lambda x: float(x.get("_learn_score", x.get("net_edge", x.get("edge", 0))) or 0), reverse=True)
     return actionable, policy_rejected
 
@@ -930,7 +968,10 @@ async def scan_and_trade(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
     max_per_scan = settings.get("max_per_scan", 10)
 
     # Phase 4: filter, rank, optional LLM re-rank
-    actionable, policy_rejected = await _filter_and_rank_signals(all_signals, selected, btc_only, effective_min_edge, strategy_multipliers, execution_policy)
+    probability_tables = dict(ls.get("probability_tables") or {})
+    actionable, policy_rejected = await _filter_and_rank_signals(
+        all_signals, selected, btc_only, effective_min_edge, strategy_multipliers, execution_policy, probability_tables
+    )
     top_signals = select_best_orders(actionable, max_per_scan)
     if llm_enabled and top_signals:
         top_signals = await llm_select_signals(top_signals, max_per_scan, mode=llm_mode, url=llm_url)
