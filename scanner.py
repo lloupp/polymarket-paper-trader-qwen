@@ -1682,7 +1682,9 @@ async def _update_weather_bias(client: httpx.AsyncClient, cache: dict[str, Any],
     try:
         resp = await client.get(
             f"{GAMMA_API}/events",
-            params={"tag_id": WEATHER_TAG_ID, "closed": "true", "limit": 100},
+            # order=id desc: without it Gamma returns the OLDEST closed events
+            # (December), never the freshly resolved ones we learn from.
+            params={"tag_id": WEATHER_TAG_ID, "closed": "true", "limit": 100, "order": "id", "ascending": "false"},
             timeout=GAMMA_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
