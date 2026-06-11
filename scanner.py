@@ -115,6 +115,13 @@ WEATHER_GEOCODE_CACHE_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_GEOCODE_CACHE
 # spaces out the burst when the cache refreshes.
 WEATHER_ENSEMBLE_FORECAST_DAYS = int(os.getenv("PAPER_WEATHER_ENSEMBLE_FORECAST_DAYS", "7"))
 WEATHER_ENSEMBLE_FETCH_DELAY_SECONDS = float(os.getenv("PAPER_WEATHER_ENSEMBLE_FETCH_DELAY", "1.0"))
+# Per-city bias correction: resolved markets reveal the official station value
+# (the bucket that paid YES); bias = mean(official - predicted median).
+WEATHER_BIAS_UPDATE_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_BIAS_UPDATE_TTL", "21600"))   # 6h
+WEATHER_BIAS_DATA_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_BIAS_DATA_TTL", "1209600"))     # 14d
+WEATHER_PRED_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_PRED_TTL", "345600"))                # 4d
+WEATHER_BIAS_MIN_SAMPLES = int(os.getenv("PAPER_WEATHER_BIAS_MIN_SAMPLES", "2"))
+WEATHER_BIAS_MAX_SAMPLES = int(os.getenv("PAPER_WEATHER_BIAS_MAX_SAMPLES", "7"))
 
 # Mean Reversion
 MEAN_REVERSION_THRESHOLD = 0.10   # 10% weekly move (primary)
@@ -384,8 +391,8 @@ def _parse_weather_date(text: str, now: Optional[datetime] = None) -> Optional[s
 
     month_names = "|".join(sorted(_MONTHS, key=len, reverse=True))
     patterns = [
-        rf"\b({month_names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*(20\d{{2}}))?\b",
-        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_names})\.?(?:\s+(20\d{{2}}))?\b",
+        rf"\b({month_names})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:(?:\s*,\s*|\s+)(20\d{{2}}))?\b",
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_names})\.?(?:(?:\s*,\s*|\s+)(20\d{{2}}))?\b",
     ]
     for pattern in patterns:
         m = re.search(pattern, text, flags=re.IGNORECASE)
@@ -558,7 +565,12 @@ def _ensemble_member_keys(hourly: Dict[str, Any], base: str) -> List[str]:
     return sorted(k for k in hourly if k.startswith(prefix))
 
 
-def _weather_probability_from_ensemble(spec: Dict[str, Any], ensemble: Dict[str, Any], date_iso: str) -> Optional[Tuple[float, float, str]]:
+def _weather_probability_from_ensemble(
+    spec: Dict[str, Any],
+    ensemble: Dict[str, Any],
+    date_iso: str,
+    bias: float = 0.0,
+) -> Optional[Tuple[float, float, str]]:
     hourly = ensemble.get("hourly") if isinstance(ensemble, dict) else None
     if not isinstance(hourly, dict):
         return None
@@ -597,7 +609,11 @@ def _weather_probability_from_ensemble(spec: Dict[str, Any], ensemble: Dict[str,
         day_values = [float(values[i]) for i in day_idx if i < len(values) and values[i] is not None]
         if not day_values:
             continue
-        aggregates.append(min(day_values) if temp_kind == "min" else max(day_values))
+        # Per-city bias (official station minus grid forecast) learned from
+        # resolved markets: the grid runs systematically off the station that
+        # settles these 1-degree buckets.
+        agg = min(day_values) if temp_kind == "min" else max(day_values)
+        aggregates.append(agg + bias)
     if not aggregates:
         return None
 
@@ -619,9 +635,10 @@ def _weather_probability_from_ensemble(spec: Dict[str, Any], ensemble: Dict[str,
     hits = sum(1 for v in aggregates if _meets(v))
     yes_prob = max(0.04, min(0.96, hits / len(aggregates)))
     median_value = sorted(aggregates)[len(aggregates) // 2]
+    bias_label = f" bias={bias:+.1f}" if bias else ""
     return yes_prob, median_value, (
         f"ensemble_{temp_kind or 'max'} members={len(aggregates)} hits={hits} "
-        f"median={median_value:.1f} {bounds_label} {spec.get('unit')}"
+        f"median={median_value:.1f} {bounds_label} {spec.get('unit')}{bias_label}"
     )
 
 # ---------------------------------------------------------------------------
@@ -1572,6 +1589,115 @@ def _weather_cache_put(cache: dict[str, Any], key: str, payload: Any, now_ts: fl
     cache[key] = {"ts": now_ts, "payload": payload}
 
 
+def _weather_cache_ttl_for(key: str) -> float:
+    """Prune TTL by key prefix (geo/pred/bias live much longer than ensembles)."""
+    if key.startswith("geo:"):
+        return WEATHER_GEOCODE_CACHE_TTL_SECONDS
+    if key.startswith("pred:"):
+        return WEATHER_PRED_TTL_SECONDS
+    if key.startswith(("bias:", "bias_samples:", "bias_updated_at")):
+        return WEATHER_BIAS_DATA_TTL_SECONDS
+    return WEATHER_ENSEMBLE_CACHE_TTL_SECONDS
+
+
+def _official_value_from_resolved_event(event: dict[str, Any]) -> tuple[str, str, str, str, float] | None:
+    """Extract (location, unit, temp_kind, date_iso, official_value) from a resolved daily-temp event.
+
+    The bucket market that paid YES reveals the official station reading
+    (band midpoint for exact buckets). Open-ended bands are skipped.
+    """
+    slug_text = str(event.get("slug") or "").replace("-", " ")
+    for raw in event.get("markets") or []:
+        prices = raw.get("outcomePrices")
+        if isinstance(prices, str):
+            try:
+                prices = json.loads(prices)
+            except json.JSONDecodeError:
+                continue
+        if not prices:
+            continue
+        try:
+            yes_final = float(prices[0])
+        except (TypeError, ValueError):
+            continue
+        if yes_final < 0.99:
+            continue
+        text = f"{raw.get('question') or ''} {slug_text}"
+        spec = _parse_weather_metric(text)
+        if not spec or spec.get("metric") != "temperature" or spec.get("operator") != "band":
+            return None
+        lo, hi = spec.get("band_low"), spec.get("band_high")
+        if lo is None or hi is None:
+            return None  # open-ended winner ("33°C or higher") — no point value
+        location = _parse_weather_location(text)
+        date_iso = _parse_weather_date(slug_text)  # slug carries the year
+        if not location or not date_iso:
+            return None
+        return (
+            location.lower(),
+            str(spec.get("unit", "fahrenheit")),
+            str(spec.get("temp_kind", "max")),
+            date_iso,
+            (lo + hi) / 2.0,
+        )
+    return None
+
+
+async def _update_weather_bias(client: httpx.AsyncClient, cache: dict[str, Any], now_ts: float) -> bool:
+    """Learn per-city station-vs-grid bias from resolved markets; returns True if cache changed."""
+    if _weather_cache_get(cache, "bias_updated_at", WEATHER_BIAS_UPDATE_TTL_SECONDS, now_ts) is not None:
+        return False
+    try:
+        resp = await client.get(
+            f"{GAMMA_API}/events",
+            params={"tag_id": WEATHER_TAG_ID, "closed": "true", "limit": 100},
+            timeout=GAMMA_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+    except Exception as e:
+        logger.debug("Weather bias: resolved events fetch failed: %s", e)
+        return False
+    if not isinstance(events, list):
+        return False
+
+    updated_keys = set()
+    for event in events:
+        try:
+            parsed = _official_value_from_resolved_event(event)
+            if not parsed:
+                continue
+            location, unit, kind, date_iso, official = parsed
+            pred = _weather_cache_get(cache, f"pred:{location}:{unit}:{kind}:{date_iso}", WEATHER_PRED_TTL_SECONDS, now_ts)
+            if pred is None:
+                continue  # we never forecast this city/date — nothing to learn from
+            err = official - float(pred)
+            skey = f"bias_samples:{location}:{unit}:{kind}"
+            entry = cache.get(skey) or {}
+            samples = entry.get("payload") if isinstance(entry, dict) else None
+            samples = list(samples) if isinstance(samples, list) else []
+            samples = [s for s in samples if isinstance(s, list) and len(s) == 2 and s[0] != date_iso]
+            samples.append([date_iso, round(err, 3)])
+            samples = sorted(samples, key=lambda s: s[0])[-WEATHER_BIAS_MAX_SAMPLES:]
+            _weather_cache_put(cache, skey, samples, now_ts)
+            updated_keys.add((location, unit, kind, skey))
+        except Exception as e:
+            logger.debug("Weather bias: failed to process resolved event: %s", e)
+
+    for location, unit, kind, skey in updated_keys:
+        samples = (cache.get(skey) or {}).get("payload") or []
+        errs = [float(s[1]) for s in samples if isinstance(s, list) and len(s) == 2]
+        if len(errs) < WEATHER_BIAS_MIN_SAMPLES:
+            continue
+        clamp = 4.0 if unit == "celsius" else 7.0
+        bias = max(-clamp, min(clamp, sum(errs) / len(errs)))
+        _weather_cache_put(cache, f"bias:{location}:{unit}:{kind}", round(bias, 3), now_ts)
+        logger.info("Weather bias: %s (%s,%s) = %+.2f (n=%d)", location, unit, kind, bias, len(errs))
+
+    _weather_cache_put(cache, "bias_updated_at", True, now_ts)
+    return True
+
+
 async def _weather_geocode(client: httpx.AsyncClient, location: str) -> Optional[Dict[str, Any]]:
     try:
         resp = await client.get(
@@ -1660,6 +1786,7 @@ async def detect_weather_forecast(
     cache_dirty = False
 
     async with httpx.AsyncClient(timeout=WEATHER_TIMEOUT_SECONDS, trust_env=False) as client:
+        cache_dirty |= await _update_weather_bias(client, disk_cache, now_ts)
         for m in markets:
             try:
                 if m.closed or not m.active:
@@ -1717,8 +1844,22 @@ async def detect_weather_forecast(
                         await asyncio.sleep(WEATHER_ENSEMBLE_FETCH_DELAY_SECONDS)
                     ensemble_cache[cache_key] = ensemble
                 ensemble = ensemble_cache.get(cache_key)
-                probability = _weather_probability_from_ensemble(spec, ensemble, date_iso) if ensemble else None
+                kind = str(spec.get("temp_kind", "max"))
+                loc_key = location.lower()
+                bias_raw = _weather_cache_get(
+                    disk_cache, f"bias:{loc_key}:{unit}:{kind}", WEATHER_BIAS_DATA_TTL_SECONDS, now_ts
+                )
+                bias = float(bias_raw) if bias_raw is not None else 0.0
+                probability = _weather_probability_from_ensemble(spec, ensemble, date_iso, bias=bias) if ensemble else None
                 forecast_source = "gfs_ensemble"
+                if probability and spec.get("metric") == "temperature":
+                    # Persist the predicted median so resolved markets can teach
+                    # us the station-vs-grid bias for this city/date later on.
+                    pred_key = f"pred:{loc_key}:{unit}:{kind}:{date_iso}"
+                    if pred_key not in disk_cache:
+                        # store the raw (un-biased) median: bias is learned against it
+                        _weather_cache_put(disk_cache, pred_key, round(probability[1] - bias, 3), now_ts)
+                        cache_dirty = True
 
                 if not probability:
                     forecast = forecast_cache.get(cache_key)
@@ -1781,9 +1922,8 @@ async def detect_weather_forecast(
     if cache_dirty:
         # Prune expired entries so the cache file stays bounded.
         for key in list(disk_cache):
-            ttl = WEATHER_GEOCODE_CACHE_TTL_SECONDS if key.startswith("geo:") else WEATHER_ENSEMBLE_CACHE_TTL_SECONDS
             entry = disk_cache.get(key)
-            if not isinstance(entry, dict) or now_ts - float(entry.get("ts", 0) or 0) >= ttl:
+            if not isinstance(entry, dict) or now_ts - float(entry.get("ts", 0) or 0) >= _weather_cache_ttl_for(key):
                 disk_cache.pop(key, None)
         _save_weather_cache(disk_cache)
 

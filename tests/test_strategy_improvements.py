@@ -10,6 +10,7 @@ from scanner import (
     GammaMarket,
     _compute_momentum,
     _compute_rsi,
+    _official_value_from_resolved_event,
     _parse_clob_token_ids,
     _parse_weather_metric,
     _trader_quality_score,
@@ -219,6 +220,57 @@ class WeatherBandParsingTest(unittest.TestCase):
         yes_prob, _, note = result
         self.assertAlmostEqual(yes_prob, 0.5)
         self.assertIn("band=[26.5,27.5)", note)
+
+
+class WeatherBiasTest(unittest.TestCase):
+    def test_band_probability_applies_bias(self):
+        spec = {
+            "metric": "temperature", "operator": "band",
+            "band_low": 26.5, "band_high": 27.5,
+            "unit": "celsius", "temp_kind": "max",
+        }
+        ensemble = {
+            "hourly": {
+                "time": ["2026-06-10T12:00"],
+                # max bruto 26.0 (fora da banda); com bias +1.0 vira 27.0 (dentro)
+                "temperature_2m_member01": [26.0],
+                "temperature_2m_member02": [26.2],
+            }
+        }
+        no_bias = _weather_probability_from_ensemble(spec, ensemble, "2026-06-10")
+        with_bias = _weather_probability_from_ensemble(spec, ensemble, "2026-06-10", bias=1.0)
+        self.assertAlmostEqual(no_bias[0], 0.04)   # 0/2 membros, clamp inferior
+        self.assertAlmostEqual(with_bias[0], 0.96)  # 2/2 membros, clamp superior
+        self.assertIn("bias=+1.0", with_bias[2])
+
+    def test_official_value_from_resolved_event(self):
+        event = {
+            "slug": "highest-temperature-in-hong-kong-on-june-9-2026",
+            "markets": [
+                {"question": "Will the highest temperature in Hong Kong be 26°C on June 9?",
+                 "outcomePrices": '["0", "1"]'},
+                {"question": "Will the highest temperature in Hong Kong be 27°C on June 9?",
+                 "outcomePrices": '["1", "0"]'},
+            ],
+        }
+        parsed = _official_value_from_resolved_event(event)
+        self.assertIsNotNone(parsed)
+        location, unit, kind, date_iso, official = parsed
+        self.assertEqual(location, "hong kong")
+        self.assertEqual(unit, "celsius")
+        self.assertEqual(kind, "max")
+        self.assertEqual(date_iso, "2026-06-09")
+        self.assertAlmostEqual(official, 27.0)
+
+    def test_open_ended_winner_is_skipped(self):
+        event = {
+            "slug": "highest-temperature-in-hong-kong-on-june-9-2026",
+            "markets": [
+                {"question": "Will the highest temperature in Hong Kong be 33°C or higher on June 9?",
+                 "outcomePrices": '["1", "0"]'},
+            ],
+        }
+        self.assertIsNone(_official_value_from_resolved_event(event))
 
 
 class WeatherCacheTest(unittest.TestCase):
