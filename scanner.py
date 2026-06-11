@@ -122,6 +122,9 @@ WEATHER_BIAS_DATA_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_BIAS_DATA_TTL", "
 WEATHER_PRED_TTL_SECONDS = float(os.getenv("PAPER_WEATHER_PRED_TTL", "345600"))                # 4d
 WEATHER_BIAS_MIN_SAMPLES = int(os.getenv("PAPER_WEATHER_BIAS_MIN_SAMPLES", "2"))
 WEATHER_BIAS_MAX_SAMPLES = int(os.getenv("PAPER_WEATHER_BIAS_MAX_SAMPLES", "7"))
+# Copy-trading: trader track record changes slowly — re-scoring all wallets
+# every cycle costs 5 extra HTTP round-trips for identical answers.
+COPY_QUALITY_TTL_SECONDS = float(os.getenv("PAPER_COPY_QUALITY_TTL", "1800"))
 
 # Mean Reversion
 MEAN_REVERSION_THRESHOLD = 0.10   # 10% weekly move (primary)
@@ -1387,71 +1390,98 @@ async def detect_smart_money_copy(markets: List[GammaMarket]) -> List[Signal]:
     # numeric Gamma id, so the cross-reference index must use condition_id.
     market_by_id = {m.condition_id: m for m in markets if m.condition_id}
 
-    async with httpx.AsyncClient(timeout=SMART_MONEY_COPY_TIMEOUT_SECONDS, trust_env=True) as client:
-        for wallet_address in SMART_MONEY_COPY_WALLETS:
-            try:
+    cache = _load_weather_cache()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cache_dirty = False
+
+    async def _process_wallet(client: httpx.AsyncClient, wallet_address: str) -> list[Signal]:
+        nonlocal cache_dirty
+        out: list[Signal] = []
+        try:
+            # Quality (closed positions) moves slowly: cache it for 30 min.
+            # False = "scored and failed" (skip cheaply); fetch errors are not
+            # cached so the wallet is re-scored next cycle.
+            qkey = f"tq:{wallet_address}"
+            quality = _weather_cache_get(cache, qkey, COPY_QUALITY_TTL_SECONDS, now_ts)
+            if quality is None:
                 positions, closed_positions = await asyncio.gather(
                     _fetch_trader_positions(client, wallet_address),
                     _fetch_trader_closed_positions(client, wallet_address),
                 )
-                quality = _trader_quality_score(closed_positions, [])
-                if not quality:
+                if closed_positions:
+                    quality = _trader_quality_score(closed_positions, []) or False
+                    _weather_cache_put(cache, qkey, quality, now_ts)
+                    cache_dirty = True
+            else:
+                positions = await _fetch_trader_positions(client, wallet_address) if quality else []
+            if not quality:
+                return out
+
+            # /positions only returns open positions; redeemable=True means
+            # already resolved (awaiting redemption), not copyable.
+            open_positions = [p for p in positions if not bool(p.get("redeemable", False))]
+            total_value = sum(abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0)) for p in open_positions) or 1.0
+
+            for p in open_positions:
+                condition_id = str(p.get("conditionId") or "")
+                m = market_by_id.get(condition_id)
+                if not m:
+                    continue
+                if m.spread > SMART_MONEY_MAX_SPREAD or m.liquidity < SMART_MONEY_MIN_LIQUIDITY:
                     continue
 
-                # /positions only returns open positions; redeemable=True means
-                # already resolved (awaiting redemption), not copyable.
-                open_positions = [p for p in positions if not bool(p.get("redeemable", False))]
-                total_value = sum(abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0)) for p in open_positions) or 1.0
+                outcome = str(p.get("outcome", "")).strip().lower()
+                direction = "yes" if outcome in {"yes", "up"} else "no"
+                entry_price = m.yes_price if direction == "yes" else m.no_price
+                if entry_price <= 0.03 or entry_price >= 0.97:
+                    continue
 
-                for p in open_positions:
-                    condition_id = str(p.get("conditionId") or "")
-                    m = market_by_id.get(condition_id)
-                    if not m:
-                        continue
-                    if m.spread > SMART_MONEY_MAX_SPREAD or m.liquidity < SMART_MONEY_MIN_LIQUIDITY:
-                        continue
+                position_value = abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0))
+                weight = min(1.0, position_value / total_value)
+                edge = max(0.02, min(0.10, 0.03 + weight * 0.07))
+                model_prob = (
+                    min(0.92, m.yes_price + edge) if direction == "yes"
+                    else max(0.08, m.yes_price - edge)
+                )
+                confidence = min(0.85, 0.40 + quality["win_rate"] * 0.35 + weight * 0.15)
+                win_prob = model_prob if direction == "yes" else 1 - model_prob
+                kelly_frac, size = kelly_size(win_prob, entry_price, conservative=0.4, max_fraction=0.03)
 
-                    outcome = str(p.get("outcome", "")).strip().lower()
-                    direction = "yes" if outcome in {"yes", "up"} else "no"
-                    entry_price = m.yes_price if direction == "yes" else m.no_price
-                    if entry_price <= 0.03 or entry_price >= 0.97:
-                        continue
+                out.append(Signal(
+                    strategy="smart_money_copy",
+                    market_id=m.market_id,
+                    event_slug=_slug_or_question(m),
+                    event_title=_title_or_question(m),
+                    direction=direction,
+                    model_probability=model_prob,
+                    market_probability=m.yes_price,
+                    edge=edge,
+                    confidence=confidence,
+                    kelly_fraction=max(kelly_frac, 0.001),
+                    suggested_size=size,
+                    spread=m.spread,
+                    liquidity=m.liquidity,
+                    volume_24hr=m.volume_24hr,
+                    reasoning=(
+                        f"SMART_MONEY_COPY: wallet {wallet_address[:10]}… "
+                        f"WR:{quality['win_rate']:.0%} PF:{quality['profit_factor']:.1f} "
+                        f"side:{direction.upper()} weight:{weight:.0%} | {m.question[:50]}"
+                    ),
+                    sources=["gamma_api_markets", "polymarket_data_api", "smart_money_copy"],
+                ))
+        except Exception as e:
+            logger.debug("Smart money copy failed for wallet %s: %s", wallet_address, e)
+        return out
 
-                    position_value = abs(float(p.get("currentValue", p.get("initialValue", 0.0)) or 0.0))
-                    weight = min(1.0, position_value / total_value)
-                    edge = max(0.02, min(0.10, 0.03 + weight * 0.07))
-                    model_prob = (
-                        min(0.92, m.yes_price + edge) if direction == "yes"
-                        else max(0.08, m.yes_price - edge)
-                    )
-                    confidence = min(0.85, 0.40 + quality["win_rate"] * 0.35 + weight * 0.15)
-                    win_prob = model_prob if direction == "yes" else 1 - model_prob
-                    kelly_frac, size = kelly_size(win_prob, entry_price, conservative=0.4, max_fraction=0.03)
+    # Wallets are independent: fetch them concurrently (the sequential loop
+    # cost ~8.5s/cycle, the single biggest scan consumer).
+    async with httpx.AsyncClient(timeout=SMART_MONEY_COPY_TIMEOUT_SECONDS, trust_env=True) as client:
+        per_wallet = await asyncio.gather(*(_process_wallet(client, w) for w in SMART_MONEY_COPY_WALLETS))
+    for chunk in per_wallet:
+        signals.extend(chunk)
 
-                    signals.append(Signal(
-                        strategy="smart_money_copy",
-                        market_id=m.market_id,
-                        event_slug=_slug_or_question(m),
-                        event_title=_title_or_question(m),
-                        direction=direction,
-                        model_probability=model_prob,
-                        market_probability=m.yes_price,
-                        edge=edge,
-                        confidence=confidence,
-                        kelly_fraction=max(kelly_frac, 0.001),
-                        suggested_size=size,
-                        spread=m.spread,
-                        liquidity=m.liquidity,
-                        volume_24hr=m.volume_24hr,
-                        reasoning=(
-                            f"SMART_MONEY_COPY: wallet {wallet_address[:10]}… "
-                            f"WR:{quality['win_rate']:.0%} PF:{quality['profit_factor']:.1f} "
-                            f"side:{direction.upper()} weight:{weight:.0%} | {m.question[:50]}"
-                        ),
-                        sources=["gamma_api_markets", "polymarket_data_api", "smart_money_copy"],
-                    ))
-            except Exception as e:
-                logger.debug("Smart money copy failed for wallet %s: %s", wallet_address, e)
+    if cache_dirty:
+        _save_weather_cache(cache)
 
     signals.sort(key=lambda s: s.confidence, reverse=True)
     logger.info("Smart Money Copy: %d signals found", len(signals))
@@ -1597,6 +1627,8 @@ def _weather_cache_ttl_for(key: str) -> float:
         return WEATHER_PRED_TTL_SECONDS
     if key.startswith(("bias:", "bias_samples:", "bias_updated_at")):
         return WEATHER_BIAS_DATA_TTL_SECONDS
+    if key.startswith("tq:"):
+        return COPY_QUALITY_TTL_SECONDS
     return WEATHER_ENSEMBLE_CACHE_TTL_SECONDS
 
 

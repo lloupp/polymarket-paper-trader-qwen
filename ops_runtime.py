@@ -99,7 +99,9 @@ def choose_mode_from_history(wallet: dict[str, Any]) -> str:
 def dynamic_interval(wallet: dict[str, Any], report_metrics: dict[str, Any]) -> int:
     settings = wallet.get("settings", {}) if isinstance(wallet, dict) else {}
     fixed = int(settings.get("loop_interval_seconds", 30) or 30)
-    return max(30, min(3600, fixed))
+    # Floor lowered from 30s: with parallel settle/copy fetches the cycle work
+    # is ~12-15s, and 5-minute BTC markets benefit from denser sampling.
+    return max(15, min(3600, fixed))
 
 
 def _history_signature(hist: list[dict[str, Any]]) -> str:

@@ -476,8 +476,12 @@ async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]
     Closed markets use binary Gamma outcome prices only when they look resolved.
     """
     results: Dict[str, Dict[str, Any]] = {}
-    async with httpx.AsyncClient(timeout=GAMMA_TIMEOUT_SECONDS, trust_env=False) as client:
-        for mid in market_ids:
+    # Markets are independent; fetching them sequentially cost ~10s/cycle with
+    # ~12 open positions. Bounded concurrency keeps API pressure polite.
+    semaphore = asyncio.Semaphore(8)
+
+    async def _fetch_one(client: httpx.AsyncClient, mid: str) -> None:
+        async with semaphore:
             try:
                 for attempt in range(GAMMA_RETRY_ATTEMPTS):
                     try:
@@ -540,7 +544,6 @@ async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]
                     "resolved": resolved,
                     "question": data.get("question", ""),
                 }
-                await asyncio.sleep(0.1)
             except Exception as e:
                 logger.warning("Failed to fetch price for market %s: %s", mid, e)
                 results[mid] = {
@@ -550,6 +553,9 @@ async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]
                     "resolved": False,
                     "question": "",
                 }
+
+    async with httpx.AsyncClient(timeout=GAMMA_TIMEOUT_SECONDS, trust_env=False) as client:
+        await asyncio.gather(*(_fetch_one(client, mid) for mid in market_ids))
     return results
 
 
