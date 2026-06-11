@@ -51,6 +51,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "streak_loss_decay": 0.12,
     "streak_win_boost": 0.07,
     "shadow_strategies": "arbitrage,value,mean_reversion,volume_spike,weather_forecast",
+    # Per-strategy SL/TP overrides; a value <= 0 disables that check.
+    # btc_5m_momentum holds winners to resolution: counterfactual on 2026-06-10
+    # showed 96% of TP-closed trades (24) would resolve in favor (+$921 held vs
+    # +$638 taken), while held stops would lose MORE (-$747 vs -$687) — so TP
+    # off, SL kept.
+    "strategy_exits": {
+        "btc_5m_momentum": {"take_profit": 0.0},
+    },
 }
 
 DEFAULT_STATE: Dict[str, Any] = {
@@ -377,12 +385,20 @@ class Wallet:
         stop_loss = settings.get("stop_loss", DEFAULT_SETTINGS["stop_loss"])
         take_profit = settings.get("take_profit", DEFAULT_SETTINGS["take_profit"])
 
+        # Per-strategy overrides (e.g. btc_5m_momentum holds winners to
+        # resolution). A value <= 0 disables that check.
+        strategy = str(pos.get("strategy", "") or "")
+        exits_cfg = settings.get("strategy_exits") or DEFAULT_SETTINGS.get("strategy_exits", {})
+        overrides = exits_cfg.get(strategy, {}) if isinstance(exits_cfg, dict) else {}
+        stop_loss = overrides.get("stop_loss", stop_loss)
+        take_profit = overrides.get("take_profit", take_profit)
+
         _, pnl_pct = self.calculate_pnl(pos, current_price)
 
         # pnl_pct > 0 is profit, < 0 is loss
-        if pnl_pct <= -stop_loss:
+        if stop_loss and stop_loss > 0 and pnl_pct <= -stop_loss:
             return self.close_position(position_id, current_price, reason="stop_loss")
-        if pnl_pct >= take_profit:
+        if take_profit and take_profit > 0 and pnl_pct >= take_profit:
             return self.close_position(position_id, current_price, reason="take_profit")
 
         return None

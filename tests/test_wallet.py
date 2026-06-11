@@ -82,5 +82,46 @@ class WalletAccountingTest(unittest.TestCase):
         self.assertAlmostEqual(pnl_pct, 0.375)
 
 
+class StrategyExitOverridesTest(unittest.TestCase):
+    # fresh_wallet não define strategy_exits → vale o default de DEFAULT_SETTINGS
+    # (btc_5m_momentum com take_profit desabilitado, hold até resolução).
+
+    def test_btc_5m_winner_is_not_closed_by_take_profit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = fresh_wallet(str(Path(tmp) / "wallet.json"))
+            pos = wallet.open_position("m1", "YES", price=0.4, size=20.0,
+                                       extra={"strategy": "btc_5m_momentum"})
+            # +50% de lucro: TP global (0.25) fecharia, mas o override desliga o TP
+            self.assertIsNone(wallet.check_risk_exit(pos["id"], current_price=0.6))
+
+    def test_btc_5m_stop_loss_still_applies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = fresh_wallet(str(Path(tmp) / "wallet.json"))
+            pos = wallet.open_position("m1", "YES", price=0.4, size=20.0,
+                                       extra={"strategy": "btc_5m_momentum"})
+            closed = wallet.check_risk_exit(pos["id"], current_price=0.3)  # -25%
+            self.assertIsNotNone(closed)
+            self.assertEqual(closed["close_reason"], "stop_loss")
+
+    def test_strategy_without_override_keeps_global_take_profit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = fresh_wallet(str(Path(tmp) / "wallet.json"))
+            pos = wallet.open_position("m1", "YES", price=0.4, size=20.0,
+                                       extra={"strategy": "smart_money"})
+            closed = wallet.check_risk_exit(pos["id"], current_price=0.52)  # +30% >= 0.25
+            self.assertIsNotNone(closed)
+            self.assertEqual(closed["close_reason"], "take_profit")
+
+    def test_wallet_settings_override_beats_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet = fresh_wallet(str(Path(tmp) / "wallet.json"))
+            wallet.state["settings"]["strategy_exits"] = {"btc_5m_momentum": {"take_profit": 0.10}}
+            pos = wallet.open_position("m1", "YES", price=0.4, size=20.0,
+                                       extra={"strategy": "btc_5m_momentum"})
+            closed = wallet.check_risk_exit(pos["id"], current_price=0.6)  # +50% >= 0.10
+            self.assertIsNotNone(closed)
+            self.assertEqual(closed["close_reason"], "take_profit")
+
+
 if __name__ == "__main__":
     unittest.main()
