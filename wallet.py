@@ -343,8 +343,9 @@ class Wallet:
         # Move to history
         self.state.setdefault("history", []).append(pos)
 
-        if pos.get("trusted_for_pnl", True):
+        if pos.get("trusted_for_pnl", True) and pos.get("close_reason") != "market_resolved_5050":
             # Learning must only consume trades priced with trusted execution data.
+            # 50/50 voids (cancelled events) are refunds, not strategy outcomes.
             ls = ensure_learning_state(self.state)
             feat = build_trade_feature(pos, strategy_mode=str(self.state.get("last_strategy_mode") or "unknown"))
             append_trade_feature(ls, feat)

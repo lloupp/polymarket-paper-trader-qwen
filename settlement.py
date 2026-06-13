@@ -72,6 +72,7 @@ PAPER_ENDGAME_MIN_LIQUIDITY_EXEC = float(os.getenv("PAPER_ENDGAME_MIN_LIQUIDITY_
 PAPER_SHADOW_STRATEGIES = os.getenv("PAPER_SHADOW_STRATEGIES", "arbitrage,value,mean_reversion,volume_spike,weather_forecast")
 GAMMA_TIMEOUT_SECONDS = float(os.getenv("PAPER_GAMMA_TIMEOUT_SECONDS", "8"))
 GAMMA_RETRY_ATTEMPTS = int(os.getenv("PAPER_GAMMA_RETRY_ATTEMPTS", "2"))
+RESOLUTION_5050_GRACE_HOURS = float(os.getenv("PAPER_RESOLUTION_5050_GRACE_HOURS", "48"))
 BTC_ALIASES = {"btc_5m", "btc_5m_momentum", "ndjjwobaq"}
 
 DEFAULT_EXECUTION_POLICY = {
@@ -144,6 +145,18 @@ def _side_index(side: str) -> int:
     return 0 if str(side).upper() == "YES" else 1
 
 
+def _parse_gamma_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip())
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def resolved_side_prices_from_gamma(data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     prices = [_float_or_none(v) for v in _json_list(data.get("outcomePrices", ""))]
     if len(prices) < 2 or prices[0] is None or prices[1] is None:
@@ -154,6 +167,16 @@ def resolved_side_prices_from_gamma(data: Dict[str, Any]) -> Optional[Tuple[floa
     # probability snapshots as a deterministic settlement price.
     if yes_price in {0.0, 1.0} and no_price in {0.0, 1.0}:
         return yes_price, no_price
+    # 50/50 void resolution (cancelled event, e.g. tennis walkover). Exactly
+    # 0.5/0.5 could also be a halted-trading snapshot of a market that will
+    # still resolve binary, so only trust it after the market has been closed
+    # far longer than the normal UMA resolution window.
+    if yes_price == 0.5 and no_price == 0.5 and bool(data.get("closed")):
+        closed_at = _parse_gamma_timestamp(data.get("closedTime")) or _parse_gamma_timestamp(data.get("endDate"))
+        if closed_at is not None:
+            age_hours = (datetime.now(timezone.utc) - closed_at).total_seconds() / 3600.0
+            if age_hours >= RESOLUTION_5050_GRACE_HOURS:
+                return yes_price, no_price
     return None
 
 
@@ -542,6 +565,7 @@ async def fetch_market_prices(market_ids: List[str]) -> Dict[str, Dict[str, Any]
                     "price_source": price_source,
                     "closed": closed,
                     "resolved": resolved,
+                    "resolution_5050": resolved_prices == (0.5, 0.5),
                     "question": data.get("question", ""),
                 }
             except Exception as e:
@@ -653,11 +677,12 @@ async def settle_positions(wallet: Optional[Wallet] = None) -> Dict[str, Any]:
 
         # Check 1: Market resolved/closed
         if mdata.get("resolved"):
-            logger.info("Market resolved for position %s — closing at %.2f", pid[:8], current_price)
+            close_reason = "market_resolved_5050" if mdata.get("resolution_5050") else "market_resolved"
+            logger.info("Market resolved for position %s — closing at %.2f (%s)", pid[:8], current_price, close_reason)
             try:
                 pos["close_price_source"] = mdata.get("price_source")
-                closed = wallet.close_position(pid, current_price, reason="market_resolved")
-                closings.append({"position_id": pid, "reason": "market_resolved", "pnl": closed["pnl"]})
+                closed = wallet.close_position(pid, current_price, reason=close_reason)
+                closings.append({"position_id": pid, "reason": close_reason, "pnl": closed["pnl"]})
             except Exception as e:
                 logger.error("Failed to close resolved position %s: %s", pid[:8], e)
             continue
